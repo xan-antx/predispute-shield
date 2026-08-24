@@ -44,6 +44,10 @@ Judged on: problem taste, build quality, appropriate AI use, failure recovery.
 
 &#x20; fixtures, no test suites.
 
+\- predict\_win\_prob can return exactly 0.0 or 1.0 (isotonic saturates).
+
+&#x20; Guard any log, ratio, or division that consumes it.
+
 
 
 \## Vocabulary
@@ -70,3 +74,9 @@ Judged on: problem taste, build quality, appropriate AI use, failure recovery.
 
 \- Mark deliberate corner-cuts with `# ponytail:` naming the ceiling and upgrade path.
 
+
+## Commits
+- Commit messages describe what changed, never when. No day numbers.
+- Use conventional prefixes: feat, fix, refactor, docs, test, chore.
+- One logical unit of work per commit. Don't batch unrelated changes.
+- Example: `feat: EV decision engine with dynamic ratio penalty`

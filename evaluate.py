@@ -71,10 +71,29 @@ def threshold_2000(alerts: pd.DataFrame) -> pd.Series:
 
 
 def system(alerts: pd.DataFrame) -> pd.Series:
-    """Placeholder. decide.py replaces the uniform draw with a calibrated P(win)
-    and an expected-value comparison; the 0.5 cut is a stand-in for that."""
-    rng = random.Random(SEED + 1)
-    return pd.Series([rng.random() >= 0.5 for _ in alerts.index], index=alerts.index)
+    """Expected value on the calibrated P(win) from model.py.
+
+        EV(refund) = -amount + FEE_SAVED
+        EV(fight)  = -REPRESENT_COST - (1 - p) * (amount + RATIO_PENALTY)
+
+    Fight only when EV(fight) is strictly larger. Rearranged, that means fighting
+    once p exceeds 1 - (amount - FEE_SAVED - REPRESENT_COST) / (amount +
+    RATIO_PENALTY) -- a threshold that falls as the amount rises, because a large
+    refund forfeits a large sum while a lost fight costs the same flat penalty
+    either way. Below FEE_SAVED + REPRESENT_COST the threshold exceeds 1 and no
+    probability can justify a fight.
+    """
+    # Imported inside the function: model.py imports this module for the split,
+    # so a top-level import would close the cycle.
+    from features import share_counts
+    from model import predict_win_prob
+
+    # Share counts come from the whole file, matching how the model was trained.
+    # A 600-row slice on its own would report every ring account as unshared.
+    p = predict_win_prob(alerts, shares=share_counts(pd.read_csv(ALERTS)))
+    ev_refund = -alerts["amount"] + FEE_SAVED
+    ev_fight = -REPRESENT_COST - (1 - p) * (alerts["amount"] + RATIO_PENALTY)
+    return ev_fight > ev_refund
 
 
 STRATEGIES = {
