@@ -28,7 +28,7 @@ RATIO_PENALTY = 2000    # cost of a lost fight counting toward the monitoring ra
                         # the merchant is to the ~1% threshold -- decide.py makes it dynamic.
 
 # Ground truth and analysis-only columns. Never handed to a strategy.
-HIDDEN = ["would_win_if_fought", "persona", "text_contradiction"]
+HIDDEN = ["would_win_if_fought", "persona", "ring_archetype", "text_contradiction"]
 
 
 def load() -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -21,6 +21,19 @@ N_CUSTOMERS = 1800
 PERSONAS = ("honest", "opportunist", "ring")
 PERSONA_MIX = (0.75, 0.20, 0.05)
 
+# Ring clusters share infrastructure, but not all in the same shape. Bundling
+# device and address sharing into one signal makes the two columns collinear and
+# lets a model score "shares anything" as fraud; separating them forces it to
+# learn which kind of sharing it is looking at.
+RING_ARCHETYPES = ("tight", "dropship", "household")
+RING_ARCHETYPE_MIX = (0.40, 0.35, 0.25)
+
+# Benign sharing. A family ships to one address, a household shares one laptop.
+# Without these, every shared identifier in the dataset is fraud and the model
+# learns a rule that denies real customers their refund.
+BENIGN_ADDRESS_SHARE = 0.03
+BENIGN_DEVICE_SHARE = 0.02
+
 # Evidence weights, in log-odds of winning a fought dispute. Tuned so the
 # marginal win rate lands near 55% -- roughly what a merchant with decent
 # delivery-proof coverage sees at arbitration.
@@ -81,17 +94,32 @@ def _hex(n: int = 8) -> str:
     return f"{random.randrange(16 ** n):0{n}x}"
 
 
+def _add_benign_sharing(customers: list[dict]) -> None:
+    """Pair up a few honest customers on a shared address or device, in place.
+
+    Sharing has to exist outside the rings or it is perfectly fraud-coded, and a
+    model trained on that will deny a refund to a mother and daughter ordering to
+    the same flat. These pairs are the counterexamples that stop share counts
+    from being a proxy for guilt."""
+    honest = [i for i, c in enumerate(customers) if c["persona"] == "honest"]
+    for key, rate in (("addresses", BENIGN_ADDRESS_SHARE), ("device_fingerprint", BENIGN_DEVICE_SHARE)):
+        picked = random.sample(honest, k=2 * round(rate * len(honest) / 2))
+        for a, b in zip(picked[::2], picked[1::2]):
+            value = customers[a][key]
+            customers[b][key] = list(value) if isinstance(value, list) else value
+
+
 def make_customers(n: int) -> list[dict]:
     """Customer pool built to the persona mix by count, not by weighted draw --
     ring accounts arrive in clusters, so sampling a persona per account would
-    over-fill the pool with ring members. Each cluster shares one device
-    fingerprint and address, the only structural signal a graph feature could
-    pick up later. Everyone else gets an address pool of their own, sized so
-    that an opportunist occasionally ships to a different address."""
+    over-fill the pool with ring members. Ring clusters share infrastructure in
+    one of three shapes (see RING_ARCHETYPES), and a small slice of honest
+    customers share too, for entirely boring reasons."""
     customers: list[dict] = []
     for _ in range(round(PERSONA_MIX[0] * n)):
         customers.append({
             "persona": "honest",
+            "ring_archetype": "",
             "account_age_days": random.randint(200, 1500),
             "prior_orders": random.randint(5, 50),
             "prior_disputes": random.randint(0, 1),
@@ -101,26 +129,37 @@ def make_customers(n: int) -> list[dict]:
     for _ in range(round(PERSONA_MIX[1] * n)):
         customers.append({
             "persona": "opportunist",
+            "ring_archetype": "",
             "account_age_days": random.randint(60, 600),
             "prior_orders": random.randint(3, 20),
             "prior_disputes": random.randint(1, 4),
             "device_fingerprint": f"dev_{_hex()}",
+            # An occasional address change: same person, fresh shipping address.
             "addresses": [f"addr_{_hex()}" for _ in range(random.randint(1, 3))],
         })
+    # Archetypes are allocated by target account count, not by a weighted draw
+    # per cluster: clusters vary in size, so drawing per cluster does not control
+    # the account-level mix (see FAILURES.md, the same bug at persona level).
     target_ring = round(PERSONA_MIX[2] * n)
-    ring = 0
-    while ring < target_ring:
-        device, address = f"dev_{_hex()}", f"addr_{_hex()}"
-        for _ in range(random.randint(3, 6)):  # self plus 2 to 5 siblings
-            customers.append({
-                "persona": "ring",
-                "account_age_days": random.randint(5, 90),
-                "prior_orders": random.randint(0, 3),
-                "prior_disputes": random.randint(0, 3),
-                "device_fingerprint": device,
-                "addresses": [address],
-            })
-            ring += 1
+    for archetype, share in zip(RING_ARCHETYPES, RING_ARCHETYPE_MIX):
+        made = 0
+        while made < round(share * target_ring):
+            device, address = f"dev_{_hex()}", f"addr_{_hex()}"
+            for _ in range(random.randint(3, 6)):  # self plus 2 to 5 siblings
+                customers.append({
+                    "persona": "ring",
+                    "ring_archetype": archetype,
+                    "account_age_days": random.randint(5, 90),
+                    "prior_orders": random.randint(0, 3),
+                    "prior_disputes": random.randint(0, 3),
+                    # dropship: one device, a fresh drop address per mule.
+                    # household: one address, a different handset per account.
+                    "device_fingerprint": device if archetype != "household" else f"dev_{_hex()}",
+                    "addresses": [address if archetype != "dropship" else f"addr_{_hex()}"],
+                })
+                made += 1
+
+    _add_benign_sharing(customers)
     # Shuffle before numbering so customer_id itself carries no persona signal.
     random.shuffle(customers)
     for i, c in enumerate(customers):
@@ -206,6 +245,7 @@ def generate(n_alerts: int = N_ALERTS) -> pd.DataFrame:
             "complaint_category": category,
             "complaint_text": complaint_text(category, c["persona"], days, contradict),
             "persona": c["persona"],
+            "ring_archetype": c["ring_archetype"],
             "text_contradiction": contradict,
         }
         score = win_strength(row)
@@ -240,8 +280,25 @@ def main() -> None:
     mix = df["persona"].value_counts(normalize=True)
     assert abs(mix["honest"] - 0.75) < 0.05 and abs(mix["ring"] - 0.05) < 0.03, f"mix off:\n{mix}"
 
-    ring_devices = df[df.persona == "ring"].groupby("device_fingerprint")["customer_id"].nunique()
-    assert ring_devices.max() >= 3, "ring accounts are not sharing devices"
+    # Same check one level down. Cluster-level draws do not control account-level
+    # share, and this dataset has few enough clusters that eyeballing it lies.
+    arch = df[df.persona == "ring"].drop_duplicates("customer_id")["ring_archetype"]
+    arch_mix = arch.value_counts(normalize=True)
+    for name, share in zip(RING_ARCHETYPES, RING_ARCHETYPE_MIX):
+        assert abs(arch_mix[name] - share) < 0.10, f"ring archetype mix off:\n{arch_mix}"
+
+    dev_share = df.groupby("device_fingerprint")["customer_id"].nunique()
+    addr_share = df.groupby("address_hash")["customer_id"].nunique()
+    dev = df["device_fingerprint"].map(dev_share)
+    addr = df["address_hash"].map(addr_share)
+
+    assert dev[df.persona == "ring"].max() >= 3, "ring accounts are not sharing devices"
+    # The whole point of the archetypes: the two counts must come apart.
+    assert (dev > addr).any() and (addr > dev).any(), "device and address sharing still bundled"
+    assert dev.corr(addr) < 0.9, f"share counts still collinear: {dev.corr(addr):.2f}"
+
+    honest = df.persona == "honest"
+    assert (dev[honest] > 1).any() and (addr[honest] > 1).any(), "no benign sharing"
 
     assert len(pd.read_csv(OUT)) == 3000, "file is not 3000 rows"
 
