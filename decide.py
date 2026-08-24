@@ -23,6 +23,7 @@ import pandas as pd
 
 import audit
 import evaluate
+import llm
 from evaluate import FEE_SAVED, REPRESENT_COST
 
 # ponytail: every constant below is illustrative. Real numbers come from the
@@ -78,7 +79,8 @@ def current_ratio(state: dict) -> float:
     return state["chargebacks"] / state["transactions"]
 
 
-def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool = False) -> dict:
+def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool = False,
+           llm: dict | None = None) -> dict:
     """One alert in, one auditable record out. No side effects on state.
 
     p_win arrives as an argument rather than being fetched here so this stays
@@ -89,6 +91,12 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     persistence belongs to the caller. run_batch is the money path and logs every
     record it produces. Anything else that acts on a returned record and skips
     audit.log has broken the rule, and no assert here can catch that.
+
+    `llm` is the optional output of llm.extract_features. Only
+    has_internal_contradiction is read, and only to raise the bar on a repeat
+    deflection -- it never enters ev_fight or ev_refund. Passing None, or passing
+    a record from a failed extraction, changes nothing: the neutral default is
+    False, so an LLM outage cannot cost a customer their refund.
     """
     # CLAUDE.md hard rule: isotonic saturates, so p_win can be exactly 0.0 or
     # 1.0. Nothing below divides by it today, but a probability of exactly 1.0
@@ -125,7 +133,17 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
         # Deflection gates only. Nothing here vetoes a decision to fight: the
         # gates exist to stop the merchant being farmed for refunds, and fighting
         # is what happens when a refund is refused.
-        margin_required = ESCALATION_STEP * len(history)
+        # A complaint that contradicts itself buys one notch less benefit of the
+        # doubt: the required margin rises by one ESCALATION_STEP, exactly as if
+        # the customer had already been refunded once. On a marginal case that
+        # single notch can tip even a first deflection to fight -- deliberate
+        # teeth, not a side effect -- but it never touches p_win, ev_fight or
+        # ev_refund, and a customer whose EV case clears the step keeps their
+        # refund, contradiction or not. (As with every gate, a changed action
+        # changes merchant state for later alerts; that is policy working, not
+        # LLM output leaking into the arithmetic.)
+        contradiction = bool(llm and llm.get("has_internal_contradiction"))
+        margin_required = ESCALATION_STEP * (len(history) + contradiction)
         if not gate("lifetime_budget", len(history) < LIFETIME_DEFLECTION_BUDGET):
             action, reason = "fight", (
                 f"lifetime deflection budget spent ({len(history)}/{LIFETIME_DEFLECTION_BUDGET})"
@@ -135,9 +153,16 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
                 f"{len(recent)} deflections in the last {VELOCITY_WINDOW_DAYS} days"
             )
         elif not gate("escalating_margin", (ev_refund - ev_fight) >= margin_required):
+            # The reason must name what actually raised the bar. "repeat
+            # deflection" on a customer with zero prior deflections is the kind
+            # of audit line that falls apart the moment anyone reads it back.
+            drivers = ", ".join(
+                ([f"{len(history)} prior deflections"] if history else [])
+                + (["contradictory complaint"] if contradiction else [])
+            )
             action, reason = "fight", (
-                f"repeat deflection needs a {margin_required:,.0f} EV margin, "
-                f"has {ev_refund - ev_fight:,.0f}"
+                f"EV margin {ev_refund - ev_fight:,.0f} below the "
+                f"{margin_required:,.0f} required ({drivers})"
             )
 
     return {
@@ -154,6 +179,8 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
         "gates_passed": passed,
         "final_action": action,
         "reason": reason,
+        "llm_status": (llm or {}).get("llm_status", "not_called"),
+        "llm_contradiction": bool(llm and llm.get("has_internal_contradiction")),
     }
 
 
@@ -178,6 +205,10 @@ def apply_outcome(state: dict, record: dict, day: int, won: bool | None) -> None
 def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = False) -> pd.DataFrame:
     """Decide a whole batch in order, letting state move underneath it.
 
+    Calls llm.extract_features per alert. With DISABLE_LLM=1, no API key, or any
+    failure at all that returns the neutral defaults instantly and the batch is
+    bit-for-bit identical -- which is the property worth having, not an accident.
+
     ponytail: the simulator emits no timestamps, so the batch is spread evenly
     across a year to give the velocity window something to measure. Real alerts
     arrive with a date; emitting one from simulator.py is the fix, and the same
@@ -186,7 +217,8 @@ def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = Fals
     days = [round(i * 365 / max(len(alerts) - 1, 1)) for i in range(len(alerts))]
     records = []
     for day, (_, alert), p in zip(days, alerts.iterrows(), p_win):
-        record = decide(alert.to_dict(), float(p), state, day, kill_switch)
+        extracted = llm.extract_features(alert["complaint_text"])
+        record = decide(alert.to_dict(), float(p), state, day, kill_switch, extracted)
         # Logged before the outcome is known, which is the honest ordering: the
         # log holds what was decided and why, not what it turned out to be worth.
         audit.log(record)
@@ -285,6 +317,23 @@ def main() -> None:
     assert third["ev_decision"] == "refund", "EV should still want to refund"
     assert third["final_action"] == "fight", "gates should have vetoed the third"
     assert "lifetime_budget" not in third["gates_passed"]
+
+    # --- a contradiction tightens marginal cases and only marginal cases --
+    fresh = new_state(chargebacks=160, transactions=40_000)
+    marginal = _alert("DEMO-C", "CUST-FIRST", 21_000.0)   # EV margin ~334, under one step
+    clean = decide(marginal, 0.20, fresh, day=0)
+    flagged = decide(marginal, 0.20, fresh, day=0, llm={"has_internal_contradiction": True})
+    assert clean["final_action"] == "refund" and flagged["final_action"] == "fight", \
+        "contradiction should tip a marginal first deflection to fight"
+    assert "contradictory complaint" in flagged["reason"], flagged["reason"]
+    clear = decide(_alert("DEMO-E", "CUST-FIRST", 5_000.0), 0.05, fresh, day=0,
+                   llm={"has_internal_contradiction": True})
+    assert clear["final_action"] == "refund", \
+        "a clear refund case must survive a contradiction flag"
+    failed_ex = decide(marginal, 0.20, fresh, day=0,
+                       llm={"has_internal_contradiction": False, "llm_status": "api_error: x"})
+    assert failed_ex["final_action"] == clean["final_action"], \
+        "an LLM failure changed a decision"
 
     # --- kill switch and the confidence band ------------------------------
     killed = decide(alert, 0.75, healthy, day=0, kill_switch=True)
