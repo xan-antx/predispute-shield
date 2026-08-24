@@ -1,0 +1,180 @@
+# Pre-Dispute Deflection Shield
+
+Razorpay AI Buildathon, Track 02 (AI Risk Manager).
+
+## The problem
+
+When a customer disputes a charge, their bank sends the merchant a pre-dispute
+alert (Ethoca/Verifi-style) before the formal chargeback is filed. That window —
+minutes to hours — is the only point where a refund makes the dispute vanish
+entirely: no fee, no ratio hit, no evidence packet. Almost nobody uses it well,
+because no merchant can staff a per-alert judgement call that has to happen in
+minutes, so the real choice today is a blanket rule: refund everything or fight
+everything.
+
+## Why the window is worth more than the fee
+
+Card networks put merchants into monitoring programmes when the chargeback
+ratio crosses roughly 1% of transactions: fines first, then mandated
+remediation, then loss of card processing. So the cost of losing one dispute is
+not flat — it rises steeply as the merchant approaches the line. This system
+prices that in with a convex penalty (`ratio_penalty` in
+[decide.py](decide.py)): ₹896 per lost fight at 20% of the threshold, ₹30,899
+at 85%. The same alert, same evidence, resolves *fight* for a healthy merchant
+and *refund* for a stressed one, and that is correct behaviour, not
+inconsistency. The specific constants — floor ₹500, ceiling ₹50,000, cubic
+shape — are illustrative; the shape is the claim, the magnitudes are stand-ins
+for an acquirer's real fee schedule.
+
+## Results
+
+Every number below is negative by construction — a pre-dispute alert always
+costs money, and the game is losing less. 600 held-out alerts (20% test slice
+of a 60/20/20 split, seed 42), full table in [results.md](results.md):
+
+| Strategy | Net ₹/1000 alerts | Fought | Fights lost | Precision | Recall |
+|---|--:|--:|--:|--:|--:|
+| always_fight | -2,924,648 | 600 | 307 | 48.8% | 100% |
+| always_refund | -1,816,286 | 0 | 0 | — | 0% |
+| random | -2,444,394 | 296 | 156 | 47.3% | 47.8% |
+| threshold_2000 | -1,852,913 | 297 | 140 | 52.9% | 53.6% |
+| **system** | **-1,301,784** | **147** | **28** | **81.0%** | 40.6% |
+
+Against the incumbent behaviour — deflect everything, which is what a cautious
+merchant actually does, and which beats every naive alternative on this board —
+the system saves roughly **₹500k per 1000 alerts** (₹514,502 on this split;
+treat the last three digits as noise). Note that recall is low and deliberately
+so: below ₹1,600 no win probability justifies fighting, because deflecting a
+small winnable dispute beats winning it.
+
+## It finds a winnable subpopulation, not the expensive ones
+
+The system fights 147 of 600 alerts with mean predicted P(win) 0.804 and an
+**actual win rate of 0.810**, against a base rate of 48.8% — the calibration
+holds on rows the model never saw, exactly where money is committed. The
+obvious null hypothesis is that it just fights the big-ticket alerts. It
+doesn't: fighting the 147 *most expensive* alerts instead wins only 53.7% and
+loses ₹278,870 more per 1000, and only 88 of the two sets of 147 overlap.
+Amount matters — the EV threshold falls as amount rises, by design — but
+evidence selection is doing the majority of the work.
+
+## The model is at the noise floor
+
+Labels are sampled from a sigmoid over evidence, so even an oracle that knows
+the generative weights exactly cannot score better than the irreducible noise.
+That oracle scores Brier 0.1425 on this test slice; the shipped model scores
+0.1469 (ROC-AUC 0.862) — about 3% above a perfect oracle, and crucially **not
+below it**, which is what feature leakage would look like. The model is a
+calibrated logistic regression whose coefficients recover the simulator's
+evidence weights in the correct order. Details in
+[calibration.md](calibration.md).
+
+## Where the AI is, and where it isn't
+
+Deterministic expected-value arithmetic decides money. The LLM
+([llm.py](llm.py)) reads complaint text and returns three fields; none enters
+the feature matrix or the EV terms. Its single route to a decision is bounded
+and measured: an internal contradiction in the complaint raises the required
+EV margin by ₹500 in one policy gate, so it can tip cases whose margin is
+under that — 31 of 600 decisions when the flag is forced on for *every* alert,
+about 0.1% of net. `results.md` is checksum-identical with `DISABLE_LLM=1`,
+and the whole system runs with no key at all: every LLM failure mode returns
+neutral defaults, chosen so an outage can never cost a customer a refund.
+
+Measured against the simulator's ground truth (100-row stratified sample, two
+independent runs): contradiction detection recall **0.949** in both, precision
+1.000 — but on ~45 negatives, where a single flipped case would drop derived
+precision to ~0.75, so read precision as "high", not as certainty.
+
+## The policy layer costs money, and that's the point
+
+The full decision path — dynamic ratio penalty, deflection budgets, velocity
+caps, a kill switch, and a human queue for P(win) between 0.40 and 0.60 —
+lands between ₹1.5k and ₹82k per 1000 *behind* the raw EV strategy, depending
+on how well humans resolve the 60 queued alerts (10% of the batch). That cost
+is accepted, not hidden: EV optimises the batch you can see, and the gates
+protect against the batch you can't — the serial refund farmer, the model gone
+stale, the coin-flip case nobody should automate. Every decision lands in an
+append-only audit log ([audit.py](audit.py)) carrying the inputs, the
+arithmetic, the gates checked and the reason, written before the outcome is
+known.
+
+## Why you should distrust these numbers
+
+The data is synthetic: 3,000 alerts from [simulator.py](simulator.py), seeded
+(`random.seed(42)`, `np.random.seed(42)`), with labels sampled from a sigmoid
+over hand-chosen evidence weights. That bakes in the central assumptions —
+which evidence matters, how much irreducible noise exists (~15–20%), an 8%
+band of genuinely undecidable cases — so the model is partly recovering a
+world I built. The complaint texts are templated, so the 0.949 contradiction
+recall is an upper bound; human-written complaints would score lower. The test
+slice is 600 rows: a decile of it is 60 alerts with a 95% interval around
+±0.13, so third-decimal differences here are not findings.
+
+As evidence that these caveats are enforced rather than decorative: an earlier
+calibration correction measured well on a two-way split, was rebuilt under an
+honest three-way split, failed to reproduce, and was removed — the full
+post-mortem is in [FAILURES.md](FAILURES.md), alongside four other failures.
+Known unfixed gaps are in [LIMITATIONS.md](LIMITATIONS.md).
+
+## Why not X
+
+**Why no agent framework?** Money decisions need to be replayable and
+defensible line by line. A deterministic EV function plus explicit gates is
+auditable; an agent loop is not.
+
+**Why logistic regression over gradient boosting?** The rule, set before
+looking: switch only if boosting wins on *both* Brier and AUC. It won on
+neither, which the noise-floor analysis explains — there is almost nothing
+left to extract, so the model with readable coefficients keeps the slot.
+
+**Why doesn't the LLM decide anything?** Complaint text is written by the
+adversary. A model reading attacker-controlled text must not control money;
+here its worst case is measured at 0.1% of net, and an outage degrades to
+exactly the no-LLM system.
+
+**Why stdlib urllib instead of the openai package?** Groq's endpoint is one
+JSON POST. Adding a dependency for that violates the project's own rules more
+than it helps.
+
+## Architecture
+
+- [simulator.py](simulator.py) generates 3,000 alerts with evidence-only
+  sampled labels; persona and ring structure shape the *distributions*, never
+  the label.
+- [features.py](features.py) splits features into hard-to-fake (delivery
+  proof, account history, device/address share counts) and easy-to-fake
+  (customer-supplied category, excluded from the money path).
+- [model.py](model.py) trains a calibrated P(win) on the 60% train slice,
+  selects on the 20% calibration slice, reports only on the untouched 20% test.
+- [decide.py](decide.py) computes EV with the dynamic ratio penalty, then runs
+  the policy gates, routes coin-flips to a human queue, and prices the queue
+  as a bracket.
+- [audit.py](audit.py) appends every decision to `audit.jsonl` before the
+  outcome is known; [llm.py](llm.py) feeds one bounded policy signal in.
+
+## How this was built
+
+Implementation was written with Claude Code; architecture, the money model,
+and every judgement call about signal versus noise were mine. The recurring
+lesson of the build, documented across [FAILURES.md](FAILURES.md): three times
+a rule existed in prose but not in code — the ring archetype mix, the review
+harness's silent zero-verdict run, the DISABLE_LLM convention — and each time
+the failure recurred or nearly did until an assert made it mechanical. A
+written rule prevents nothing; only an enforced one does.
+
+## How to run
+
+```bash
+pip install -r requirements.txt
+python simulator.py     # regenerates data/alerts.csv (seeded, deterministic)
+python model.py         # trains, writes model.pkl and calibration.md
+python evaluate.py      # strategy comparison, writes results.md
+python decide.py        # EV + gates demo and batch self-check
+python audit.py         # audit-log self-check
+```
+
+Self-check entrypoints set `DISABLE_LLM=1` themselves, so bare runs never make
+API calls. For live LLM extraction and contradiction scoring, put
+`GROQ_API_KEY=...` in `.env` (gitignored) and run `python llm.py`; the
+provider and model are switchable via `LLM_PROVIDER` and `GROQ_MODEL`.
