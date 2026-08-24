@@ -1,0 +1,265 @@
+"""Expected value with a ratio-aware penalty, then policy gates that can veto it.
+
+Two ideas here. The first is that the cost of losing a fight is not a constant:
+a merchant at 0.1% chargeback ratio can afford to lose one, a merchant at 0.9%
+is one bad month from a monitoring programme, and the same lost dispute costs
+those two merchants completely different amounts. The EV maths only works if the
+penalty term knows where the merchant is standing.
+
+The second is that expected value is necessary and not sufficient. EV will
+happily refund the same customer eleven times because each refund is individually
+cheap. The gates exist to stop locally rational decisions adding up to a policy
+nobody would sign off on, and they run after EV and can overrule it.
+
+decide() never sees would_win_if_fought. run_batch() resolves outcomes with it
+only after the decision is made, which is the simulation standing in for the
+weeks a real representment takes to come back.
+"""
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+import evaluate
+from evaluate import FEE_SAVED, REPRESENT_COST
+
+# ponytail: every constant below is illustrative. Real numbers come from the
+# acquirer's fee schedule and the network's published programme thresholds, and
+# they differ by region, MCC and processing volume. The shape is the claim here;
+# the magnitudes are a plausible stand-in.
+MONITORING_THRESHOLD = 0.01     # ~1% is where Visa/Mastercard programmes begin
+PENALTY_FLOOR = 500             # a lost fight at a healthy ratio: just the admin
+PENALTY_CEILING = 50_000        # at the threshold: fines, remediation, review
+PENALTY_EXPONENT = 3            # convexity -- see ratio_penalty
+
+LIFETIME_DEFLECTION_BUDGET = 2  # refunds-on-demand a customer gets, ever
+VELOCITY_LIMIT = 2              # ...and at most this many in any
+VELOCITY_WINDOW_DAYS = 90       # ...rolling window this long
+ESCALATION_STEP = 500           # each prior deflection demands this much more EV margin
+LOW_CONFIDENCE = (0.40, 0.60)   # neither side of the coin is worth acting on alone
+
+EPS = 1e-6                      # p_win saturates at exactly 0.0 and 1.0 (isotonic)
+
+
+def ratio_penalty(current_ratio: float, threshold: float = MONITORING_THRESHOLD) -> float:
+    """Rupee cost of one more lost fight, given where the ratio already sits.
+
+    Cubic in the fraction of the threshold consumed:
+
+        penalty = FLOOR + (CEILING - FLOOR) * (ratio / threshold) ** 3
+
+    Convex on purpose. At 20% of the threshold it returns 896 -- losing a fight
+    is nearly free, so fight anything with a decent case. At 85% it returns
+    30,893, which is larger than most of the disputes in this dataset and flips
+    the EV on all but the strongest evidence. The merchant stops fighting long
+    before the ratio touches the line, which is the entire point: the penalty has
+    to bite while there is still room to correct, not after the fines arrive.
+
+    Clipped at the threshold. Past that the merchant is already in remediation
+    and the marginal cost of one more chargeback stops being the interesting
+    question -- modelling that properly needs a real programme fee schedule.
+    """
+    assert current_ratio >= 0, f"negative ratio: {current_ratio}"
+    consumed = min(current_ratio / threshold, 1.0)
+    return PENALTY_FLOOR + (PENALTY_CEILING - PENALTY_FLOOR) * consumed ** PENALTY_EXPONENT
+
+
+def new_state(chargebacks: int, transactions: int) -> dict:
+    """Mutable merchant state. `deflections` maps customer -> days they were
+    granted a refund, which is what both deflection gates read."""
+    assert transactions > 0, "ratio needs a denominator"
+    return {"chargebacks": chargebacks, "transactions": transactions, "deflections": {}}
+
+
+def current_ratio(state: dict) -> float:
+    return state["chargebacks"] / state["transactions"]
+
+
+def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool = False) -> dict:
+    """One alert in, one auditable record out. No side effects on state.
+
+    p_win arrives as an argument rather than being fetched here so this stays
+    testable on hand-built alerts, and so the deterministic money logic is
+    readable without a model in the loop.
+    """
+    # CLAUDE.md hard rule: isotonic saturates, so p_win can be exactly 0.0 or
+    # 1.0. Nothing below divides by it today, but a probability of exactly 1.0
+    # states that a dispute cannot be lost, which no evidence supports.
+    p = min(max(p_win, EPS), 1.0 - EPS)
+
+    amount = float(alert["amount"])
+    ratio = current_ratio(state)
+    penalty = ratio_penalty(ratio)
+
+    ev_refund = -amount + FEE_SAVED
+    ev_fight = -REPRESENT_COST - (1.0 - p) * (amount + penalty)
+    ev_decision = "fight" if ev_fight > ev_refund else "refund"
+
+    customer = alert["customer_id"]
+    history = state["deflections"].get(customer, [])
+    recent = [d for d in history if day - d < VELOCITY_WINDOW_DAYS]
+
+    checked: list[str] = []
+    passed: list[str] = []
+    action, reason = ev_decision, f"EV prefers {ev_decision}"
+
+    def gate(name: str, ok: bool) -> bool:
+        checked.append(name)
+        if ok:
+            passed.append(name)
+        return ok
+
+    if not gate("kill_switch", not kill_switch):
+        action, reason = "queue", "kill switch engaged, no automatic money movement"
+    elif not gate("confidence_band", not LOW_CONFIDENCE[0] <= p <= LOW_CONFIDENCE[1]):
+        action, reason = "queue", f"P(win) {p:.2f} inside the coin-flip band, needs a human"
+    elif ev_decision == "refund":
+        # Deflection gates only. Nothing here vetoes a decision to fight: the
+        # gates exist to stop the merchant being farmed for refunds, and fighting
+        # is what happens when a refund is refused.
+        margin_required = ESCALATION_STEP * len(history)
+        if not gate("lifetime_budget", len(history) < LIFETIME_DEFLECTION_BUDGET):
+            action, reason = "fight", (
+                f"lifetime deflection budget spent ({len(history)}/{LIFETIME_DEFLECTION_BUDGET})"
+            )
+        elif not gate("velocity_cap", len(recent) < VELOCITY_LIMIT):
+            action, reason = "fight", (
+                f"{len(recent)} deflections in the last {VELOCITY_WINDOW_DAYS} days"
+            )
+        elif not gate("escalating_margin", (ev_refund - ev_fight) >= margin_required):
+            action, reason = "fight", (
+                f"repeat deflection needs a {margin_required:,.0f} EV margin, "
+                f"has {ev_refund - ev_fight:,.0f}"
+            )
+
+    return {
+        "alert_id": alert["alert_id"],
+        "customer_id": customer,
+        "amount": amount,
+        "p_win": p,
+        "ev_fight": ev_fight,
+        "ev_refund": ev_refund,
+        "current_ratio": ratio,
+        "ratio_penalty": penalty,
+        "ev_decision": ev_decision,
+        "gates_checked": checked,
+        "gates_passed": passed,
+        "final_action": action,
+        "reason": reason,
+    }
+
+
+def apply_outcome(state: dict, record: dict, day: int, won: bool | None) -> None:
+    """Advance merchant state after a decision resolves.
+
+    A deflection spends budget and never becomes a chargeback -- that is the
+    product. A lost fight becomes one. A queued alert moves nothing, because a
+    human has not acted on it yet.
+
+    ponytail: only *lost* fights increment the ratio here, per the spec. Under
+    Visa's VDMP the chargeback counts from the moment it is filed, win or lose,
+    which would make fighting materially more expensive near the threshold.
+    Worth modelling before anyone quotes these numbers at an acquirer.
+    """
+    if record["final_action"] == "refund":
+        state["deflections"].setdefault(record["customer_id"], []).append(day)
+    elif record["final_action"] == "fight" and won is False:
+        state["chargebacks"] += 1
+
+
+def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = False) -> pd.DataFrame:
+    """Decide a whole batch in order, letting state move underneath it.
+
+    ponytail: the simulator emits no timestamps, so the batch is spread evenly
+    across a year to give the velocity window something to measure. Real alerts
+    arrive with a date; emitting one from simulator.py is the fix, and the same
+    missing field is what forces the share-count leakage noted in features.py.
+    """
+    days = [round(i * 365 / max(len(alerts) - 1, 1)) for i in range(len(alerts))]
+    records = []
+    for day, (_, alert), p in zip(days, alerts.iterrows(), p_win):
+        record = decide(alert.to_dict(), float(p), state, day, kill_switch)
+        # The label is read only here, after the decision exists, standing in for
+        # the weeks a real representment takes to come back.
+        won = bool(alert["would_win_if_fought"]) if record["final_action"] == "fight" else None
+        apply_outcome(state, record, day, won)
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def _alert(alert_id: str, customer_id: str, amount: float) -> dict:
+    return {"alert_id": alert_id, "customer_id": customer_id, "amount": amount}
+
+
+def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    print("Ratio penalty curve (rupees per lost fight):")
+    for r in (0.000, 0.002, 0.004, 0.006, 0.008, 0.0085, 0.010, 0.012):
+        print(f"  ratio {r:6.2%}  ->  {ratio_penalty(r):10,.0f}")
+
+    # --- the same alert, two merchants ------------------------------------
+    alert = _alert("DEMO-1", "CUST-DEMO", 5000.0)
+    healthy = new_state(chargebacks=160, transactions=40_000)    # 0.40%
+    stressed = new_state(chargebacks=340, transactions=40_000)   # 0.85%
+    a = decide(alert, 0.75, healthy, day=0)
+    b = decide(alert, 0.75, stressed, day=0)
+
+    print("\nSame alert (₹5,000, P(win) 0.75), two merchants:")
+    for label, r in (("0.40% ratio", a), ("0.85% ratio", b)):
+        print(f"  {label}: penalty {r['ratio_penalty']:>9,.0f} | "
+              f"EV fight {r['ev_fight']:>10,.0f} vs refund {r['ev_refund']:>9,.0f} "
+              f"-> {r['final_action']}")
+    assert a["final_action"] == "fight", "healthy merchant should fight this"
+    assert b["final_action"] == "refund", "stressed merchant should deflect this"
+
+    # --- a customer asking for a third refund -----------------------------
+    state = new_state(chargebacks=160, transactions=40_000)
+    print("\nSame customer, three small alerts EV says refund:")
+    for i in range(3):
+        record = decide(_alert(f"DEMO-{i}", "CUST-REPEAT", 900.0), 0.20, state, day=i * 10)
+        apply_outcome(state, record, day=i * 10, won=None)
+        print(f"  attempt {i + 1}: {record['final_action']:6} | gates passed "
+              f"{len(record['gates_passed'])}/{len(record['gates_checked'])} | {record['reason']}")
+    assert state["deflections"]["CUST-REPEAT"] == [0, 10], "should have spent exactly two"
+
+    third = decide(_alert("DEMO-4", "CUST-REPEAT", 900.0), 0.20, state, day=30)
+    assert third["ev_decision"] == "refund", "EV should still want to refund"
+    assert third["final_action"] == "fight", "gates should have vetoed the third"
+    assert "lifetime_budget" not in third["gates_passed"]
+
+    # --- kill switch and the confidence band ------------------------------
+    killed = decide(alert, 0.75, healthy, day=0, kill_switch=True)
+    assert killed["final_action"] == "queue", "kill switch must stop automatic action"
+    coin_flip = decide(alert, 0.50, healthy, day=0)
+    assert coin_flip["final_action"] == "queue", "coin-flip band must route to a human"
+    for p in (0.0, 1.0):
+        r = decide(alert, p, healthy, day=0)
+        assert 0.0 < r["p_win"] < 1.0, "saturated probability reached the record unclamped"
+
+    # --- the whole test split ---------------------------------------------
+    from features import share_counts
+    from model import predict_win_prob
+
+    _, _, test = evaluate.load()
+    p = predict_win_prob(test.drop(columns=evaluate.HIDDEN),
+                         shares=share_counts(pd.read_csv(evaluate.ALERTS)))
+    batch_state = new_state(chargebacks=160, transactions=40_000)
+    records = run_batch(test, p, batch_state)
+
+    counts = records["final_action"].value_counts()
+    queued = counts.get("queue", 0) / len(records)
+    print(f"\nTest split ({len(records)} alerts), starting ratio 0.40%:")
+    for action, n in counts.items():
+        print(f"  {action:7} {n:4d}  ({n / len(records):.1%})")
+    print(f"  ratio moved 0.400% -> {current_ratio(batch_state):.3%}")
+    print(f"  vetoed by a gate: {int((records.ev_decision != records.final_action).sum())}")
+    print(f"\nhuman queue: {queued:.1%} of the test set")
+
+    assert len(records) == len(test), "lost rows in the batch"
+    assert records["p_win"].between(EPS, 1 - EPS).all(), "unclamped probability in the ledger"
+
+
+if __name__ == "__main__":
+    main()
