@@ -48,6 +48,10 @@ Judged on: problem taste, build quality, appropriate AI use, failure recovery.
 
 &#x20; Guard any log, ratio, or division that consumes it.
 
+\- Self-check runs use DISABLE\_LLM=1. Live API calls only when explicitly
+
+&#x20; scoring the LLM.
+
 
 
 \## Vocabulary
