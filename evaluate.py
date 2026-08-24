@@ -18,7 +18,8 @@ import pandas as pd
 ALERTS = Path("data/alerts.csv")
 RESULTS = Path("results.md")
 
-TEST_FRAC = 0.30
+TEST_FRAC = 0.20
+CALIB_FRAC = 0.20
 SEED = 42
 
 REPRESENT_COST = 400    # analyst time plus gateway fee to assemble and file an evidence packet
@@ -31,12 +32,21 @@ RATIO_PENALTY = 2000    # cost of a lost fight counting toward the monitoring ra
 HIDDEN = ["would_win_if_fought", "persona", "ring_archetype", "text_contradiction"]
 
 
-def load() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """70/30 split. Only the test half is ever scored; the train half exists so
-    the model in decide.py cannot accidentally be fit on scored rows."""
+def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """60/20/20 train / calibration / test.
+
+    Three ways, not two, because the calibration correction in model.py is
+    itself fitted on data. Fitting it on the scored rows made its own Brier look
+    perfect while estimating nothing -- it was learning that holdout's noise.
+    The calibration slice pays for an honest number on test.
+
+    Test is carved out first so it stays identical regardless of what happens
+    upstream of it, and every strategy here is scored on that slice alone."""
     df = pd.read_csv(ALERTS)
     test = df.sample(frac=TEST_FRAC, random_state=SEED)
-    return df.drop(test.index), test
+    rest = df.drop(test.index)
+    calibration = rest.sample(frac=CALIB_FRAC / (1 - TEST_FRAC), random_state=SEED)
+    return rest.drop(calibration.index), calibration, test
 
 
 # Strategies. Each takes the visible alert columns and returns a boolean Series:
@@ -130,7 +140,8 @@ def markdown(results: dict[str, dict]) -> str:
     n = next(iter(results.values()))["rows"]
     return (
         f"# Strategy comparison\n\n"
-        f"{n} test alerts (30% holdout, seed {SEED}). Net is rupees; less negative is better.\n"
+        f"{n} test alerts (20% holdout of a 60/20/20 split, seed {SEED}). "
+        f"Net is rupees; less negative is better.\n"
         f"Precision/recall are for the decision to fight, scored against `would_win_if_fought`.\n"
         f"FP cost = rupees lost by fighting disputes we lost, versus deflecting them.\n"
         f"FN cost = rupees lost by refunding disputes we would have won.\n\n"
@@ -140,7 +151,8 @@ def markdown(results: dict[str, dict]) -> str:
 
 
 def main() -> None:
-    _, test = load()
+    train, calibration, test = load()
+    assert (len(train), len(calibration), len(test)) == (1800, 600, 600), "split drifted"
     visible = test.drop(columns=HIDDEN)
     assert not set(HIDDEN) & set(visible.columns), "a strategy can see ground truth"
 

@@ -77,24 +77,19 @@ def calibration_table(y: pd.Series, p: np.ndarray, bins: int = BUCKETS) -> pd.Da
 
 
 def build_correction(table: pd.DataFrame) -> dict:
-    """Turn the decile table into a lookup: raw probability -> observed rate.
+    """Turn a decile table into a lookup: raw probability -> observed rate.
 
-    The measured gap is worst exactly where money gets committed. On the held-out
-    set the top decile claimed 0.935 and delivered 0.867, and the 0.879-0.912
-    bucket claimed 0.900 and delivered 0.856. An EV rule sends precisely those
-    alerts to a fight, so shipping the raw number means paying for six or seven
-    points of confidence that were never there.
+    REPORTING ONLY. Nothing in the money path calls this. It was built to fix an
+    apparent over-confidence at the decision boundary, measured on a two-way
+    split; a three-way split showed the gap did not reproduce and that applying
+    the map made both Brier and AUC worse on rows it had not been fitted to. See
+    FAILURES.md. It stays here because the comparison it enables -- raw versus
+    corrected, both scored on test -- is the evidence for that call, and a claim
+    with its own disproof attached is worth more than a deleted function.
 
-    The raw bucket rates are not monotone -- small-sample noise puts a lower
-    observed rate on a higher-predicted bucket -- so they go through a weighted
-    isotonic pass first. Without it, an alert with better evidence could come
-    back with a lower P(win), which is indefensible in front of a merchant.
-
-    ponytail: this is fitted on the same holdout the model is scored on, so any
-    metric computed after correction is in-sample and not an honest estimate.
-    It is applied anyway because being systematically conservative about money
-    beats being statistically pure about a number nobody spends. The upgrade is
-    a third split used only for calibration, which 3000 rows does not support.
+    Bucket rates pass through a weighted isotonic step because the raw rates are
+    not monotone: small-sample noise can put a lower observed rate on a
+    higher-predicted bucket, which would hand better evidence a worse P(win).
     """
     monotone = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit_transform(
         table["predicted"], table["actual"], sample_weight=table["n"]
@@ -132,51 +127,58 @@ def _score(y: pd.Series, p: np.ndarray) -> dict:
 
 
 def train(include_easy: bool = False) -> dict:
-    """Fit both candidates on one feature set, score on the holdout, pick one."""
-    train_df, test_df = evaluate.load()
-    assert (len(train_df), len(test_df)) == (2100, 900), "split does not match evaluate.py"
-    assert not train_df.index.intersection(test_df.index).size, "train and test overlap"
+    """Fit on train, pick and correct on calibration, score on test.
 
-    full = pd.concat([train_df, test_df]).sort_index()
+    Nothing touches test until the last three lines. Model selection and the
+    decile correction both consume data, so both happen on the calibration
+    slice; that is what makes the corrected number on test an estimate rather
+    than a restatement of the rows it was fitted on."""
+    train_df, calib_df, test_df = evaluate.load()
+    assert (len(train_df), len(calib_df), len(test_df)) == (1800, 600, 600), \
+        "split does not match evaluate.py"
+    for a, b in ((train_df, calib_df), (train_df, test_df), (calib_df, test_df)):
+        assert not a.index.intersection(b.index).size, "splits overlap"
+
+    full = pd.concat([train_df, calib_df, test_df]).sort_index()
     x = build_features(full, shares=share_counts(full), include_easy=include_easy)
-    x_train, x_test = x.loc[train_df.index], x.loc[test_df.index]
-    y_train, y_test = train_df[LABEL], test_df[LABEL]
+    x_train, x_calib, x_test = x.loc[train_df.index], x.loc[calib_df.index], x.loc[test_df.index]
+    y_train, y_calib, y_test = train_df[LABEL], calib_df[LABEL], test_df[LABEL]
 
-    fitted, metrics, tables, probs = {}, {}, {}, {}
+    fitted, calib_metrics, calib_tables = {}, {}, {}
     for name, estimator in _models().items():
         estimator.fit(x_train, y_train)
-        p = estimator.predict_proba(x_test)[:, 1]
-        fitted[name], probs[name] = estimator, p
-        metrics[name] = _score(y_test, p)
-        tables[name] = calibration_table(y_test, p)
+        p = estimator.predict_proba(x_calib)[:, 1]
+        assert ((p >= 0) & (p <= 1)).all(), f"{name} produced a probability outside [0,1]"
+        fitted[name] = estimator
+        calib_metrics[name] = _score(y_calib, p)
+        calib_tables[name] = calibration_table(y_calib, p)
 
-    lr, gb = metrics["logistic"], metrics["gradient_boosting"]
+    lr, gb = calib_metrics["logistic"], calib_metrics["gradient_boosting"]
     # Interpretability is the tiebreak, not the metric. A coefficient I can read
     # out to a panel is worth more than a marginal lift I would have to defend
-    # with a partial dependence plot.
+    # with a partial dependence plot. Decided on calibration, never on test.
     gb_wins = gb["brier"] < lr["brier"] and gb["auc"] > lr["auc"]
     chosen = "gradient_boosting" if gb_wins else "logistic"
+    correction = build_correction(calib_tables[chosen])
 
-    for name, p in probs.items():
-        assert ((p >= 0) & (p <= 1)).all(), f"{name} produced a probability outside [0,1]"
+    raw = fitted[chosen].predict_proba(x_test)[:, 1]
+    corrected = apply_correction(raw, correction)
     baseline = brier_score_loss(y_test, np.full(len(y_test), 0.5))
-    assert metrics[chosen]["brier"] < baseline, "chosen model loses to a constant 0.5"
-
-    correction = build_correction(tables[chosen])
-    corrected = apply_correction(probs[chosen], correction)
+    assert ((corrected >= 0) & (corrected <= 1)).all(), "correction left [0,1]"
+    assert _score(y_test, raw)["brier"] < baseline, "chosen model loses to a constant 0.5"
 
     return {
         "name": chosen,
         "model": fitted[chosen],
         "features": list(x.columns),
         "include_easy": include_easy,
-        "metrics": metrics[chosen],
-        "all_metrics": metrics,
-        "tables": tables,
         "calibration": correction,
-        "baseline_brier": baseline,
-        # In-sample by construction; kept to show the correction does what it claims.
+        "calib_metrics": calib_metrics,
+        "calib_tables": calib_tables,
+        "metrics": _score(y_test, raw),
         "corrected_metrics": _score(y_test, corrected),
+        "test_table": calibration_table(y_test, raw),
+        "baseline_brier": baseline,
     }
 
 
@@ -199,50 +201,76 @@ def report(hard: dict, full: dict, saved: dict) -> str:
     h, f = hard["metrics"], full["metrics"]
     correction_rows = "".join(
         f"| {r.bucket} | {r.n} | {r.predicted:.3f} | {r.actual:.3f} | {v:.3f} |\n"
-        for r, v in zip(saved["tables"][saved["name"]].itertuples(), saved["calibration"]["values"])
+        for r, v in zip(saved["calib_tables"][saved["name"]].itertuples(),
+                        saved["calibration"]["values"])
     )
+    raw, corr = saved["metrics"], saved["corrected_metrics"]
     return (
         "# Calibration\n\n"
-        "900 held-out alerts, deciles of predicted P(win). Split and rows are "
-        "identical to `evaluate.py`.\n\n"
+        "60/20/20 train / calibration / test, seed 42. The model is fitted on "
+        "1800 rows, model selection and the rejected correction used a separate "
+        "600, and every number in this file is measured on the remaining 600 that "
+        "neither has seen. `evaluate.py` scores its strategies on that same test "
+        "slice.\n\n"
+        "## Does the decile correction help? No.\n\n"
+        "It is measured here and **not applied**. `predict_win_prob` returns the "
+        "raw isotonic-calibrated probability. Both rows below are scored on test, "
+        "which neither the model nor the correction was fitted to:\n\n"
+        "| P(win) as returned | ROC-AUC | Brier |\n|---|--:|--:|\n"
+        f"| raw model output (shipped) | {raw['auc']:.4f} | {raw['brier']:.4f} |\n"
+        f"| after decile correction | {corr['auc']:.4f} | {corr['brier']:.4f} |\n"
+        f"| delta | {corr['auc'] - raw['auc']:+.4f} | "
+        f"{corr['brier'] - raw['brier']:+.4f} |\n\n"
+        "Worse on both. The correction was built to fix an apparent -0.146 gap at "
+        "the decision boundary on an earlier two-way split; that gap did not "
+        "reproduce (calibration +0.027, test -0.109, train -0.008, all with "
+        "confidence intervals wide enough to contain each other). See FAILURES.md.\n\n"
         "## Cost of dropping customer-supplied features\n\n"
         "The money path excludes the easy-to-fake block (`complaint_category` "
         "one-hots). A claimant writes that field, so a model that leans on it can "
         "be moved by rewording a complaint. This is what the exclusion costs:\n\n"
         "| Feature set | ROC-AUC | Brier | Features |\n|---|--:|--:|--:|\n"
         f"| hard-to-fake only (shipped) | {h['auc']:.4f} | {h['brier']:.4f} | {len(hard['features'])} |\n"
-        f"| all features | {f['auc']:.4f} | {f['brier']:.4f} | {len(full['features'])} |\n"
-        f"| **delta** | **{h['auc'] - f['auc']:+.4f}** | **{h['brier'] - f['brier']:+.4f}** | "
-        f"**{len(hard['features']) - len(full['features'])}** |\n\n"
+        f"| all features | {f['auc']:.4f} | {f['brier']:.4f} | {len(full['features'])} |\n\n"
+        "**The exclusion costs approximately nothing.** That is the whole claim, "
+        "and the decimals above should not be read more precisely than that. Test "
+        "is 600 rows: a decile of it holds 60 alerts, and a 60-row bucket at "
+        "p≈0.5 carries a 95% interval of roughly ±0.13. Differences of this size "
+        "between two feature sets sit inside that band. Treating a fourth-decimal "
+        "gap as a finding is the mistake already written up in FAILURES.md.\n\n"
         f"Reproduce with `python model.py --with-easy`.\n\n"
-        "## Applied correction\n\n"
-        "Raw predictions are mapped through the observed rate for their bucket "
-        "before being returned by `predict_win_prob`. Bucket rates pass through a "
-        "weighted isotonic step first, so the mapping cannot invert the ranking.\n\n"
+        "## The correction that was measured and rejected\n\n"
+        "Kept for reference, not applied. This is the map that would have replaced "
+        "each raw prediction with the observed rate for its bucket, fitted on the "
+        "calibration slice. Bucket rates pass through a weighted isotonic step, "
+        "without which a higher-predicted bucket could return a lower P(win).\n\n"
         "| Bucket | n | Model says | Actually won | Returned |\n|---|--:|--:|--:|--:|\n"
         f"{correction_rows}\n"
         f"## Chosen: {saved['name']}\n\n"
         "Rule: default to logistic regression; switch only if gradient boosting "
-        "wins on Brier *and* AUC.\n\n"
-        "| Model | Brier (lower better) | ROC-AUC |\n|---|--:|--:|\n"
-        f"| logistic | {saved['all_metrics']['logistic']['brier']:.4f} | "
-        f"{saved['all_metrics']['logistic']['auc']:.3f} |\n"
-        f"| gradient_boosting | {saved['all_metrics']['gradient_boosting']['brier']:.4f} | "
-        f"{saved['all_metrics']['gradient_boosting']['auc']:.3f} |\n"
-        f"| constant 0.5 | {saved['baseline_brier']:.4f} | 0.500 |\n\n"
-        "## Per-model detail\n\n"
-        + "".join(_table_md(n, saved["all_metrics"][n], saved["tables"][n]) for n in saved["tables"])
+        "wins on Brier *and* AUC. Decided on calibration, before test was touched.\n\n"
+        "| Model (on calibration) | Brier (lower better) | ROC-AUC |\n|---|--:|--:|\n"
+        f"| logistic | {saved['calib_metrics']['logistic']['brier']:.4f} | "
+        f"{saved['calib_metrics']['logistic']['auc']:.3f} |\n"
+        f"| gradient_boosting | {saved['calib_metrics']['gradient_boosting']['brier']:.4f} | "
+        f"{saved['calib_metrics']['gradient_boosting']['auc']:.3f} |\n"
+        f"| constant 0.5 (on test) | {saved['baseline_brier']:.4f} | 0.500 |\n\n"
+        "## Honest calibration on test\n\n"
+        "Raw model output, bucketed on the rows nothing was fitted to.\n\n"
+        + _table_md(saved["name"] + " on test", raw, saved["test_table"])
     )
 
 
 def predict_win_prob(df: pd.DataFrame, shares: dict[str, pd.Series] | None = None) -> np.ndarray:
     """P(win if fought) for raw alert rows. decide.py imports this.
 
-    The returned number is the *observed* win rate for the bucket the model's
-    raw prediction falls into, not the model's own claim. On the holdout the top
-    decile claimed 0.935 and delivered 0.867; an EV rule fed the raw number
-    would authorise fights priced on six points of confidence that do not exist.
-    See build_correction for how the mapping is fitted and what it costs.
+    Returns the model's isotonic-calibrated probability directly. An earlier
+    version mapped it through a decile correction measured on a holdout; on a
+    proper three-way split that correction lost on both Brier and AUC, and the
+    over-confidence it existed to fix turned out to be sampling noise in a
+    60-row bucket. FAILURES.md has the intervals. The lesson worth keeping: the
+    cv=5 isotonic layer inside the model is calibration fitted on training
+    folds, which is the layer that earns its place.
 
     ponytail: share counts default to whatever `df` contains, which is right for
     scoring the whole file and wrong for scoring one alert in isolation -- a
@@ -255,8 +283,7 @@ def predict_win_prob(df: pd.DataFrame, shares: dict[str, pd.Series] | None = Non
         _CACHED = joblib.load(MODEL_PKL)
     x = build_features(df, shares=shares, include_easy=_CACHED["include_easy"])
     assert list(x.columns) == _CACHED["features"], "feature matrix drifted from the trained model"
-    raw = _CACHED["model"].predict_proba(x)[:, 1]
-    return apply_correction(raw, _CACHED["calibration"])
+    return _CACHED["model"].predict_proba(x)[:, 1]
 
 
 def main() -> None:
@@ -283,12 +310,14 @@ def main() -> None:
     assert values == sorted(values), "correction inverts the ranking"
 
     # Round trip through the pickle: what decide.py imports must reproduce what
-    # was just scored, correction included.
+    # was just scored.
     df = pd.read_csv(evaluate.ALERTS)
     p = predict_win_prob(df)
     assert ((p >= 0) & (p <= 1)).all(), "probabilities outside [0,1] after reload"
     assert len(p) == len(df)
-    assert set(np.unique(p)).issubset(set(values)), "correction not applied on reload"
+    # Continuous, not the nine steps the correction used to impose. If this ever
+    # trips, something has quietly re-entered the money path.
+    assert len(np.unique(p)) > len(values), "predict_win_prob is returning bucketed values"
 
     print(f"\nchosen: {saved['name']} on "
           f"{'all' if saved['include_easy'] else 'hard-to-fake'} features "
