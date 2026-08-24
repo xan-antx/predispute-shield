@@ -20,6 +20,13 @@ skip the call entirely; the system runs fully without it, and evaluate.py
 produces identical numbers either way because none of this reaches the decision
 arithmetic.
 
+Provider is chosen by LLM_PROVIDER (groq | anthropic, default groq). Groq's
+OpenAI-compatible endpoint is one JSON POST, done with stdlib urllib because the
+openai package would be a new dependency for a single request shape; Anthropic
+uses its SDK, which is already a project dependency. Everything downstream of
+the transport -- prompt, parsing, retry, circuit breaker, truncation -- is
+provider-blind.
+
 The complaint text is written by the disputing customer, who in this system may
 be a fraudster. It is treated as hostile input end to end: capped in length
 before it buys tokens, never able to widen its own influence past the three
@@ -30,13 +37,25 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.request
+from pathlib import Path
 
-MODEL = "claude-sonnet-4-6"
+PROVIDERS = ("groq", "anthropic")
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+# Env-overridable because Groq retires models under you: llama-3.3-70b-versatile
+# was the original choice here and returned model_not_found within the build.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 MAX_TOKENS = 300
 TIMEOUT_SECONDS = 12.0
 MAX_TEXT_CHARS = 4000     # complaints fit in a fraction of this; the cap exists so
                           # a hostile customer cannot buy an arbitrary token bill
 CIRCUIT_LIMIT = 5         # consecutive API errors before we stop calling at all
+SCORE_THROTTLE = 2.5      # ponytail: seconds between scoring calls, sized for the
+                          # Groq free tier (~30 RPM / ~12k TPM). A paid tier or a
+                          # batch endpoint removes the need; the money path never
+                          # sleeps -- this throttle exists only in measurement.
 CATEGORIES = ("non_receipt", "not_as_described", "unauthorised", "other")
 
 # Neutral until proven otherwise. "other" commits to nothing, 0.5 is the middle
@@ -47,6 +66,9 @@ DEFAULTS = {
     "specificity_score": 0.5,
     "llm_status": "default",
 }
+
+SYSTEM_PROMPT = ("You extract structured fields from dispute complaints. "
+                 "You reply with one JSON object and no other text.")
 
 PROMPT = """Extract three fields from this customer dispute complaint.
 
@@ -77,19 +99,53 @@ Complaint:
 {text}{transcript}"""
 
 _client = None
+_provider: str | None = None
 _unavailable_reason: str | None = None
 _consecutive_api_errors = 0
 
 
+def _load_dotenv() -> None:
+    """Minimal .env loader: KEY=VALUE lines into os.environ, never overriding
+    what the shell already set. python-dotenv would be a new dependency for
+    ten lines of stdlib."""
+    path = Path(".env")
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if value.strip():
+            os.environ.setdefault(key.strip(), value.strip())
+
+
 def _get_client():
-    """Build the client once. A missing key is a normal operating condition here,
-    not an error: the system is designed to run without this file working."""
-    global _client, _unavailable_reason
+    """Resolve provider and credentials once. A missing key is a normal
+    operating condition here, not an error: the system is designed to run
+    without this file working."""
+    global _client, _provider, _unavailable_reason
     # Reason first: once set (missing creds, open circuit) it wins even if a
-    # client object was already built.
+    # client was already built.
     if _unavailable_reason is not None:
         return None
     if _client is not None:
+        return _client
+
+    _load_dotenv()
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    if provider not in PROVIDERS:
+        _unavailable_reason = f"unknown LLM_PROVIDER {provider!r}"
+        return None
+    _provider = provider
+
+    if provider == "groq":
+        if not os.environ.get("GROQ_API_KEY"):
+            # Checked up front so a 600-alert batch does not make 600 doomed
+            # calls and wait out 600 timeouts to reach the same defaults.
+            _unavailable_reason = "GROQ_API_KEY not set"
+            return None
+        _client = "groq-http"   # plain HTTP, no SDK; sentinel keeps the cache shape
         return _client
 
     try:
@@ -99,8 +155,6 @@ def _get_client():
         _unavailable_reason = f"anthropic import failed: {type(exc).__name__}"
         return None
     if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        # Checked up front so a 600-alert batch does not make 600 doomed calls
-        # and wait out 600 timeouts to reach the same defaults.
         # ponytail: the SDK can also resolve an `ant auth login` profile or
         # workload identity federation; this guard covers only the env vars.
         # Anyone on profile auth can export ANTHROPIC_AUTH_TOKEN to get past it.
@@ -114,6 +168,52 @@ def _get_client():
         _unavailable_reason = f"client init failed: {type(exc).__name__}"
         return None
     return _client
+
+
+def _request(client, prompt: str):
+    """One provider call. Transport errors raise; the caller classifies them.
+
+    No auto-retry on the Groq path (the SDK gives Anthropic one transient
+    retry): the circuit breaker and the per-alert fallback carry that weight,
+    and a hand-rolled retry loop around urllib is complexity this file exists
+    to avoid."""
+    if _provider == "groq":
+        req = urllib.request.Request(
+            f"{GROQ_BASE_URL}/chat/completions",
+            data=json.dumps({
+                "model": GROQ_MODEL,
+                "max_tokens": MAX_TOKENS,
+                "temperature": 0,
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                             {"role": "user", "content": prompt}],
+            }).encode(),
+            headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}",
+                     "Content-Type": "application/json",
+                     # Cloudflare fronts the endpoint and 403s urllib's default
+                     # user agent (error 1010). Any honest UA string passes.
+                     "User-Agent": "predispute-shield/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+            return json.load(resp)
+    return client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def _response_text(response) -> str:
+    """Provider-native response -> text. Degenerate shapes raise here, inside
+    the parse guard: the Anthropic SDK deserialises non-strictly, an
+    OpenAI-shaped body can arrive without choices, and both must degrade,
+    never propagate."""
+    if _provider == "groq":
+        text = response["choices"][0]["message"]["content"]
+        if not isinstance(text, str):
+            raise ValueError(f"content is {type(text).__name__}")
+        return text
+    return "".join(b.text for b in response.content if b.type == "text")
 
 
 def _parse(raw: str) -> dict:
@@ -176,17 +276,11 @@ def extract_features(complaint_text: str, chat_transcript: str | None = None) ->
     last = "unknown"
     for status, prompt in attempts:
         try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system="You extract structured fields from dispute complaints. "
-                       "You reply with one JSON object and no other text.",
-                messages=[{"role": "user", "content": prompt}],
-            )
+            response = _request(client, prompt)
         except Exception as exc:                  # noqa: BLE001 - see module docstring
             # Deliberately broad. Timeout, rate limit, auth, connection, a 500,
-            # or something the SDK has not invented yet all mean the same thing
-            # to this system: carry on without the LLM.
+            # or something the provider has not invented yet all mean the same
+            # thing to this system: carry on without the LLM.
             _consecutive_api_errors += 1
             if _consecutive_api_errors >= CIRCUIT_LIMIT and _unavailable_reason is None:
                 # Circuit breaker: a dead API should cost the batch a handful of
@@ -196,19 +290,16 @@ def extract_features(complaint_text: str, chat_transcript: str | None = None) ->
             return {**DEFAULTS, "llm_status": f"api_error: {type(exc).__name__}"}
 
         try:
-            # Inside the guard on purpose: the SDK deserialises non-strictly, so
-            # a degenerate body can hand back content=None or a text block whose
-            # text is None, and both must degrade, never raise.
-            raw = "".join(b.text for b in response.content if b.type == "text")
+            raw = _response_text(response)
             result = {**_parse(raw), "llm_status": status}
             _consecutive_api_errors = 0
             return result
-        except (ValueError, KeyError, TypeError, AttributeError,
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError,
                 OverflowError, json.JSONDecodeError) as exc:
             # Only a parse failure retries, and only once. Retrying an API error
-            # is the SDK's job; retrying a parse failure needs a firmer prompt.
-            # str(exc) is capped: it can quote model output, which is steerable
-            # by the complaint author, and this string lands in the audit log.
+            # is the transport's job; retrying a parse failure needs a firmer
+            # prompt. str(exc) is capped: it can quote model output, which is
+            # steerable by the complaint author, and it lands in the audit log.
             last = f"{type(exc).__name__}: {str(exc)[:80]}"
 
     return {**DEFAULTS, "llm_status": f"parse_failed: {last}"}
@@ -237,7 +328,11 @@ def score_contradictions(n: int = 100, seed: int = 42) -> dict:
     negatives = alerts[~alerts.text_contradiction].sample(n - n // 2, random_state=seed)
     sample = pd.concat([positives, negatives]).sample(frac=1, random_state=seed)
 
-    extracted = [extract_features(t) for t in sample["complaint_text"]]
+    extracted = []
+    for complaint in sample["complaint_text"]:
+        extracted.append(extract_features(complaint))
+        if not extracted[-1]["llm_status"].startswith("skipped"):
+            time.sleep(SCORE_THROTTLE)
     scored = [(e["has_internal_contradiction"], t)
               for e, t in zip(extracted, sample["text_contradiction"].tolist())
               if e["llm_status"].startswith("ok")]
@@ -264,7 +359,7 @@ def score_contradictions(n: int = 100, seed: int = 42) -> dict:
 
 
 def main() -> None:
-    global _client, _unavailable_reason, _consecutive_api_errors
+    global _client, _provider, _unavailable_reason, _consecutive_api_errors, _request
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     from types import SimpleNamespace as NS
 
@@ -275,7 +370,7 @@ def main() -> None:
     assert isinstance(result["has_internal_contradiction"], bool)
     assert 0.0 <= result["specificity_score"] <= 1.0
     live_ok = result["llm_status"].startswith("ok")
-    print(f"live call: {result['llm_status']}")
+    print(f"live call ({_provider or 'no provider'}): {result['llm_status']}")
 
     # --- _parse rejects malformed, absorbs fenced -------------------------
     for bad in ('not json at all', '{"complaint_category": "banana"}', '{}',
@@ -294,71 +389,86 @@ def main() -> None:
                     '"has_internal_contradiction": true, "specificity_score": 0.8}\n```')
     assert fenced["has_internal_contradiction"] is True
 
-    # --- hostile response shapes, proven without a key by stubbing the ----
-    # client directly. Saved and restored so live scoring below still works.
-    saved = (_client, _unavailable_reason, _consecutive_api_errors)
+    # --- hostile response shapes for BOTH providers, no network needed ----
+    saved = (_client, _provider, _unavailable_reason, _consecutive_api_errors, _request)
     saved_env = os.environ.pop("DISABLE_LLM", None)
 
-    def stub(*responses):
+    def stub_request(*responses):
         seq = iter(responses)
-        return NS(messages=NS(create=lambda **kw: next(seq)))
+        return lambda client, prompt: next(seq)
 
     good = ('{"complaint_category": "non_receipt", '
             '"has_internal_contradiction": true, "specificity_score": 0.9}')
-    hostile = [
-        NS(content=None),                                # SDK non-strict deserialisation
-        NS(content=[NS(type="text", text=None)]),        # text block without text
-        NS(content=[NS(type="thinking")]),               # no text blocks at all
-        NS(content=[NS(type="text", text='{"complaint_category": "other", '
-                       '"has_internal_contradiction": false, "specificity_score": '
-                       + "9" * 400 + "}")]),             # float() overflow after clean JSON
-        NS(content=[NS(type="text", text='{"complaint_category": "'
-                       + "INJECTED " * 40 + '", "has_internal_contradiction": false, '
-                       '"specificity_score": 0.5}')]),   # steered text aimed at the audit log
-    ]
-    for resp in hostile:
-        _client, _unavailable_reason, _consecutive_api_errors = stub(resp, resp), None, 0
-        out = extract_features("x")
-        assert out["llm_status"].startswith("parse_failed"), out
-        assert out["has_internal_contradiction"] is False
-        assert len(out["llm_status"]) <= len("parse_failed: ") + 100, "status not capped"
-    print(f"{len(hostile)} hostile response shapes -> neutral defaults, none raised")
+    hostile = {
+        "anthropic": [
+            NS(content=None),                            # SDK non-strict deserialisation
+            NS(content=[NS(type="text", text=None)]),    # text block without text
+            NS(content=[NS(type="thinking")]),           # no text blocks at all
+            NS(content=[NS(type="text", text='{"complaint_category": "other", '
+                           '"has_internal_contradiction": false, "specificity_score": '
+                           + "9" * 400 + "}")]),         # float() overflow after clean JSON
+            NS(content=[NS(type="text", text='{"complaint_category": "'
+                           + "INJECTED " * 40 + '", "has_internal_contradiction": false, '
+                           '"specificity_score": 0.5}')]),  # steered text aimed at the audit log
+        ],
+        "groq": [
+            {},                                          # body without choices
+            {"choices": []},                             # empty choices -> IndexError
+            {"choices": [{"message": {"content": None}}]},
+            {"choices": [{"message": {"content": "no json here at all"}}]},
+        ],
+    }
+    for provider, responses in hostile.items():
+        _provider = provider
+        for resp in responses:
+            _client, _unavailable_reason, _consecutive_api_errors = "stub", None, 0
+            _request = stub_request(resp, resp)
+            out = extract_features("x")
+            assert out["llm_status"].startswith("parse_failed"), (provider, out)
+            assert out["has_internal_contradiction"] is False
+            assert len(out["llm_status"]) <= len("parse_failed: ") + 100, "status not capped"
+    print(f"{sum(map(len, hostile.values()))} hostile response shapes "
+          f"across both providers -> neutral defaults, none raised")
 
-    _client, _unavailable_reason, _consecutive_api_errors = \
-        stub(NS(content=[NS(type="text", text="no json here")]),
-             NS(content=[NS(type="text", text=good)])), None, 0
+    _provider, _client, _unavailable_reason, _consecutive_api_errors = "groq", "stub", None, 0
+    _request = stub_request({"choices": [{"message": {"content": "no json here"}}]},
+                            {"choices": [{"message": {"content": good}}]})
     out = extract_features("x")
     assert out["llm_status"] == "ok_retry" and out["complaint_category"] == "non_receipt"
     print("stricter-prompt retry recovers a parse failure")
 
-    def dead(**kw):
+    def dead(client, prompt):
         raise ConnectionError("api down")
-    _client, _unavailable_reason, _consecutive_api_errors = NS(messages=NS(create=dead)), None, 0
+    _client, _unavailable_reason, _consecutive_api_errors, _request = "stub", None, 0, dead
     for _ in range(CIRCUIT_LIMIT):
         assert extract_features("x")["llm_status"].startswith("api_error")
     out = extract_features("x")
     assert out["llm_status"].startswith("skipped: circuit open"), out
     print(f"circuit opens after {CIRCUIT_LIMIT} consecutive API errors")
 
-    _client, _unavailable_reason = stub(NS(content=[NS(type="text", text=good)])), None
+    _client, _unavailable_reason = "stub", None
+    _request = stub_request({"choices": [{"message": {"content": good}}]})
     os.environ["DISABLE_LLM"] = "1"
     assert extract_features("x")["llm_status"] == "skipped: DISABLE_LLM=1", \
         "DISABLE_LLM ignored once a client exists"
     os.environ.pop("DISABLE_LLM")
     print("DISABLE_LLM=1 honoured mid-process, cached client or not")
 
-    _client, _unavailable_reason, _consecutive_api_errors = saved
+    _client, _provider, _unavailable_reason, _consecutive_api_errors, _request = saved
     if saved_env is not None:
         os.environ["DISABLE_LLM"] = saved_env
 
     # --- live scoring, only when a real call succeeded above --------------
     if not live_ok:
         print(f"\nno live scoring: {_unavailable_reason or 'DISABLE_LLM=1'}")
-        print("degradation paths verified; set ANTHROPIC_API_KEY and rerun for precision/recall")
+        print("degradation paths verified; set a provider key and rerun for precision/recall")
         return
 
+    print(f"\nscoring contradiction detection on {_provider} "
+          f"({GROQ_MODEL if _provider == 'groq' else ANTHROPIC_MODEL}), "
+          f"throttled {SCORE_THROTTLE}s/call...")
     stats = score_contradictions()
-    print(f"\ncontradiction detection, {stats['n']} scored (stratified 50/50, "
+    print(f"contradiction detection, {stats['n']} scored (stratified 50/50, "
           f"{stats['excluded_failures']} failed extractions excluded):")
     print(f"  tp {stats['tp']}  fp {stats['fp']}  fn {stats['fn']}  tn {stats['tn']}")
     print(f"  recall               {stats['recall']:.3f}")
@@ -367,7 +477,7 @@ def main() -> None:
     print(f"  precision at the real {stats['prevalence']:.1%} rate: "
           f"{stats['precision_at_prevalence']:.3f}")
     if stats["fp"] == 0:
-        print("  note: zero false positives in 50 negatives puts the derived "
+        print("  note: zero false positives in ~50 negatives puts the derived "
               "precision at exactly 1.0 -- read it as 'high', not as certainty")
 
 
