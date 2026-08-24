@@ -38,6 +38,7 @@ VELOCITY_LIMIT = 2              # ...and at most this many in any
 VELOCITY_WINDOW_DAYS = 90       # ...rolling window this long
 ESCALATION_STEP = 500           # each prior deflection demands this much more EV margin
 LOW_CONFIDENCE = (0.40, 0.60)   # neither side of the coin is worth acting on alone
+HUMAN_REVIEW_COST = 250         # analyst time to read one queued alert and call it
 
 EPS = 1e-6                      # p_win saturates at exactly 0.0 and 1.0 (isotonic)
 
@@ -188,6 +189,53 @@ def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = Fals
     return pd.DataFrame(records)
 
 
+def bracket_cost(alerts: pd.DataFrame, records: pd.DataFrame, penalty=None) -> dict:
+    """Net rupees for a batch, with the human queue costed two ways.
+
+    A queued alert is not free and it is not resolved. Reporting only the 540
+    alerts the system acted on would flatter it by hiding the 60 it declined to
+    handle, so the queue gets bracketed instead: an analyst who calls every one
+    correctly, and an analyst who refunds the lot. Neither is realistic. The true
+    figure is somewhere between them, and saying so is more honest than picking a
+    middle number and defending it.
+
+    `penalty` defaults to evaluate.py's flat RATIO_PENALTY. That is the fixed
+    yardstick every strategy on the leaderboard is measured against -- the
+    dynamic penalty is what the decision rule *believes* a lost fight will cost
+    given where the ratio sits, and scoring one strategy on its own beliefs
+    while scoring the rest on a constant compares nothing. Pass the per-alert
+    dynamic penalty to see the same batch under its own assumptions.
+    """
+    if penalty is None:
+        penalty = evaluate.RATIO_PENALTY
+    amount = alerts["amount"].to_numpy()
+    won = alerts["would_win_if_fought"].astype(bool).to_numpy()
+    action = records["final_action"].to_numpy()
+
+    refund_payoff = -amount + FEE_SAVED
+    fight_payoff = pd.Series(float(-REPRESENT_COST), index=alerts.index).where(
+        won, -amount - REPRESENT_COST - penalty
+    ).to_numpy()
+
+    acted = (action == "refund") * refund_payoff + (action == "fight") * fight_payoff
+    queued = action == "queue"
+    # Best case: the analyst has the outcome in hand and picks the better branch.
+    # Worst case: the analyst does what a cautious human does and refunds.
+    best = acted + queued * (-HUMAN_REVIEW_COST + pd.DataFrame(
+        {"r": refund_payoff, "f": fight_payoff}).max(axis=1).to_numpy())
+    worst = acted + queued * (-HUMAN_REVIEW_COST + refund_payoff)
+
+    per_1000 = lambda v: v.sum() / len(alerts) * 1000
+    return {
+        "n": len(alerts),
+        "queued": int(queued.sum()),
+        "review_cost": HUMAN_REVIEW_COST * int(queued.sum()),
+        "best": per_1000(best),
+        "worst": per_1000(worst),
+        "acted_only": acted[~queued].sum() / max((~queued).sum(), 1) * 1000,
+    }
+
+
 def _alert(alert_id: str, customer_id: str, amount: float) -> dict:
     return {"alert_id": alert_id, "customer_id": customer_id, "amount": amount}
 
@@ -257,6 +305,30 @@ def main() -> None:
     print(f"  vetoed by a gate: {int((records.ev_decision != records.final_action).sum())}")
     print(f"\nhuman queue: {queued:.1%} of the test set")
 
+    # --- costing the queue, so this is comparable to evaluate.py -----------
+    cost = bracket_cost(test, records)
+    baselines = {name: fn(test.drop(columns=evaluate.HIDDEN))
+                 for name, fn in evaluate.STRATEGIES.items()
+                 if name in ("system", "always_refund")}
+    scored = {name: evaluate.score(f, test)["net_per_1000"] for name, f in baselines.items()}
+
+    print(f"\nNet ₹ per 1000 alerts, all {cost['n']} rows, flat RATIO_PENALTY yardstick:")
+    print(f"  decide.py, queue resolved perfectly   {cost['best']:>12,.0f}   <- optimistic bound")
+    print(f"  decide.py, queue refunded wholesale   {cost['worst']:>12,.0f}   <- pessimistic bound")
+    print(f"  evaluate.py `system` (no queue)       {scored['system']:>12,.0f}")
+    print(f"  always_refund                         {scored['always_refund']:>12,.0f}")
+    print(f"  review cost included in both bounds: {cost['review_cost']:,} "
+          f"({cost['queued']} alerts x {HUMAN_REVIEW_COST})")
+
+    # The same batch charged the penalty the rule itself believed at decision
+    # time. Not comparable to the rows above -- shown so the gap between the
+    # yardstick and the rule's own assumptions is visible rather than buried.
+    own = bracket_cost(test, records, penalty=records["ratio_penalty"].to_numpy())
+    print(f"  ...same batch under its own dynamic penalty: "
+          f"{own['worst']:,.0f} to {own['best']:,.0f}")
+
+    assert cost["best"] >= cost["worst"], "bracket is inverted"
+    assert cost["worst"] > scored["always_refund"], "worse than refunding everything"
     assert len(records) == len(test), "lost rows in the batch"
     assert records["p_win"].between(EPS, 1 - EPS).all(), "unclamped probability in the ledger"
 
