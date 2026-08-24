@@ -122,6 +122,12 @@ def execute_refund(payment_id: str, amount: float, alert_id: str) -> dict:
                "execution_status": "initiated"})
     payload = {"amount": int(round(amount * 100)),   # rupees -> paise
                "notes": {"alert_id": alert_id},
+               # Load-bearing, not just traceability: Razorpay enforces
+               # server-side uniqueness on receipt, so alert_id here is a second
+               # independent idempotency layer. Even if this process lost its
+               # audit log entirely, the provider rejects the duplicate.
+               # Discovered live, when a retry came back "Duplicate receipt
+               # found for this refund request."
                "receipt": alert_id}
     try:
         body = _post(f"{RAZORPAY_BASE}/payments/{payment_id}/refund", payload, creds)

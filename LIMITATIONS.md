@@ -62,3 +62,15 @@ carries a 95% interval of roughly ±0.13. Differences in the third or fourth
 decimal of Brier, AUC or win rate are not findings at this size — that mistake is
 already written up in `FAILURES.md` and the same caution applies to every number
 in `calibration.md` and `results.md`.
+
+## Full-amount refunds 400 in Razorpay test mode
+
+Across six live test-mode attempts, every refund of the entire remaining
+balance of a payment (₹10 of ₹10; ₹8 when ₹2 was already refunded) returned
+Razorpay's generic `400 BAD_REQUEST_ERROR: invalid request sent`, while every
+partial refund of the same payment, through the same code path, with the same
+field shape, succeeded. The likely fix — omit `amount` entirely, since
+Razorpay defaults an amount-less refund to the full balance — is untested
+here. A production deployment refunds whole payments as its normal case, so
+it would hit this immediately; resolve it against Razorpay support or the
+omit-amount variant before relying on `execute_refund` for full refunds.
