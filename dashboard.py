@@ -66,7 +66,10 @@ st.caption("Fixed alert: ₹5,000, P(win) 0.75, signed delivery proof. Identical
 
 # --- 3. the audit trail --------------------------------------------------
 st.header("Audit trail -- last 20 decisions")
-log = audit.read().tail(20).copy()
+log = audit.read()
+# The log also carries refund-execution lines (marked by an "event" field);
+# this panel shows decisions, which are the rows carrying a reason.
+log = log[log["reason"].notna()].tail(20).copy() if "reason" in log.columns else log
 log["vetoed"] = log["ev_decision"] != log["final_action"]
 for col in ("gates_checked", "gates_passed"):
     log[col] = log[col].apply(", ".join)

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import actions
 import audit
 import evaluate
 import llm
@@ -224,6 +225,18 @@ def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = Fals
     for day, (_, alert), p in zip(days, alerts.iterrows(), p_win):
         extracted = llm.extract_features(alert["complaint_text"])
         record = decide(alert.to_dict(), float(p), state, day, kill_switch, extracted)
+        if record["final_action"] == "refund":
+            # Execution runs its own write-ahead log lines; the decision record
+            # carries the outcome so one row tells the whole story. Simulated
+            # alerts have no payment id, so one is derived -- real alerts arrive
+            # with the pay_... reference attached.
+            execution = actions.execute_refund(
+                payment_id=str(alert.get("payment_id", f"pay_sim_{record['alert_id']}")),
+                amount=record["amount"], alert_id=record["alert_id"])
+            record["execution_status"] = execution["execution_status"]
+            record["provider_refund_id"] = execution["provider_refund_id"]
+        else:
+            record["execution_status"], record["provider_refund_id"] = "not_applicable", None
         # Logged before the outcome is known, which is the honest ordering: the
         # log holds what was decided and why, not what it turned out to be worth.
         audit.log(record)

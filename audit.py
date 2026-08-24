@@ -75,25 +75,31 @@ def main() -> None:
     records = decide.run_batch(test, p, decide.new_state(160, 40_000))
 
     after = line_count()
-    assert after - before == len(records), f"logged {after - before} of {len(records)} decisions"
-
     with LOG.open(encoding="utf-8") as f:
         lines = [line for line in f if line.strip()][before:]
     parsed = [json.loads(line) for line in lines]          # raises if any line is malformed
-    assert len(parsed) == len(records), "round trip lost a record"
+    # The batch appends decision records plus refund-execution lines (marked by
+    # an "event" field); one decision per alert, executions alongside.
+    decisions = [r for r in parsed if "event" not in r]
+    assert len(decisions) == len(records), f"logged {len(decisions)} of {len(records)} decisions"
+    assert after - before == len(parsed), "line count disagrees with parse"
 
     required = {"alert_id", "p_win", "ev_fight", "ev_refund", "current_ratio", "ratio_penalty",
-                "ev_decision", "gates_checked", "gates_passed", "final_action", "reason"}
-    missing = required - set(parsed[0])
+                "ev_decision", "gates_checked", "gates_passed", "final_action", "reason",
+                "execution_status"}
+    missing = required - set(decisions[0])
     assert not missing, f"decision record is missing {sorted(missing)}"
-    assert all(required <= set(r) for r in parsed), "a record dropped fields mid-batch"
+    assert all(required <= set(r) for r in decisions), "a record dropped fields mid-batch"
+    refunds = [r for r in decisions if r["final_action"] == "refund"]
+    assert all(r["execution_status"] != "not_applicable" for r in refunds), \
+        "a refund decision skipped execution"
 
     df = read()
     assert len(df) == after, "read() disagrees with the file"
 
     # A veto has to be readable straight off the line: EV wanted one thing, a
     # gate produced another, and the failed gate is the one checked but not passed.
-    fresh = df.tail(len(records))
+    fresh = pd.DataFrame(decisions)
     vetoed = fresh[fresh.ev_decision != fresh.final_action]
     assert len(vetoed), "no veto in this batch -- the check cannot prove it is visible"
     assert all(len(r.gates_passed) < len(r.gates_checked) for r in vetoed.itertuples()), \
