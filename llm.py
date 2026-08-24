@@ -1,11 +1,15 @@
-"""The only AI in the system. It reads text and it decides nothing.
+"""The only AI in the system. It reads text; deterministic logic decides.
 
-Three structured fields out of free-form complaint text, and none of them touch
-the money path. complaint_category is already excluded from features.py;
-specificity_score is reporting only; has_internal_contradiction is allowed to
-tighten one policy gate in decide.py and nothing else. If this file returned
-"refund" it would be a different system with a different risk profile, and the
-argument for it would have to be made to a regulator rather than a judge.
+Three structured fields out of free-form complaint text, with one bounded route
+to a decision. complaint_category is already excluded from features.py;
+specificity_score is reporting only; has_internal_contradiction feeds exactly
+one policy gate in decide.py, where it raises the required EV margin by one
+step (₹500) -- enough to tip a deflection whose margin is under that, and
+measured at 31 of 600 decisions (~0.1% of net) when forced on for every alert.
+It never enters ev_fight, ev_refund, p_win or the feature matrix. If this file
+returned "refund" it would be a different system with a different risk profile,
+and the argument for it would have to be made to a regulator rather than a
+judge.
 
 Everything here is written to fail into neutrality. Timeout, malformed JSON, API
 error, missing key, degenerate response shapes, no credentials at all -- every

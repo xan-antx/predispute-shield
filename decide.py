@@ -93,10 +93,14 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     audit.log has broken the rule, and no assert here can catch that.
 
     `llm` is the optional output of llm.extract_features. Only
-    has_internal_contradiction is read, and only to raise the bar on a repeat
-    deflection -- it never enters ev_fight or ev_refund. Passing None, or passing
-    a record from a failed extraction, changes nothing: the neutral default is
-    False, so an LLM outage cannot cost a customer their refund.
+    has_internal_contradiction is read, and only by the escalating_margin gate:
+    it raises the required EV margin by one ESCALATION_STEP, so it can flip a
+    deflection -- including a first one -- whose margin is under ₹500. Measured
+    ceiling: forcing the flag on for every alert in the 600-row test batch
+    changes 31 decisions and moves net by ~0.1%. It never enters ev_fight,
+    ev_refund or p_win. Passing None, or a record from a failed extraction,
+    changes nothing: the neutral default is False, so an LLM outage cannot cost
+    a customer their refund.
     """
     # CLAUDE.md hard rule: isotonic saturates, so p_win can be exactly 0.0 or
     # 1.0. Nothing below divides by it today, but a probability of exactly 1.0
