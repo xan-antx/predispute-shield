@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import audit
 import evaluate
 from evaluate import FEE_SAVED, REPRESENT_COST
 
@@ -83,6 +84,11 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     p_win arrives as an argument rather than being fetched here so this stays
     testable on hand-built alerts, and so the deterministic money logic is
     readable without a model in the loop.
+
+    Deliberately does not write to the audit log: this is the pure function, and
+    persistence belongs to the caller. run_batch is the money path and logs every
+    record it produces. Anything else that acts on a returned record and skips
+    audit.log has broken the rule, and no assert here can catch that.
     """
     # CLAUDE.md hard rule: isotonic saturates, so p_win can be exactly 0.0 or
     # 1.0. Nothing below divides by it today, but a probability of exactly 1.0
@@ -181,6 +187,9 @@ def run_batch(alerts: pd.DataFrame, p_win, state: dict, kill_switch: bool = Fals
     records = []
     for day, (_, alert), p in zip(days, alerts.iterrows(), p_win):
         record = decide(alert.to_dict(), float(p), state, day, kill_switch)
+        # Logged before the outcome is known, which is the honest ordering: the
+        # log holds what was decided and why, not what it turned out to be worth.
+        audit.log(record)
         # The label is read only here, after the decision exists, standing in for
         # the weeks a real representment takes to come back.
         won = bool(alert["would_win_if_fought"]) if record["final_action"] == "fight" else None
