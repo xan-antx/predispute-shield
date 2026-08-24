@@ -13,6 +13,7 @@ that already reads the file.
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,9 @@ def line_count(path: Path = LOG) -> int:
 
 
 def main() -> None:
+    # CLAUDE.md hard rule: self-checks never make live calls. setdefault keeps
+    # an explicit DISABLE_LLM=0 able to override for a deliberate live run.
+    os.environ.setdefault("DISABLE_LLM", "1")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     # Imported here: decide.py imports this module, and a top-level import

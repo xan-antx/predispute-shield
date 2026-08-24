@@ -16,6 +16,7 @@ only after the decision is made, which is the simulation standing in for the
 weeks a real representment takes to come back.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -286,6 +287,9 @@ def _alert(alert_id: str, customer_id: str, amount: float) -> dict:
 
 
 def main() -> None:
+    # CLAUDE.md hard rule: self-checks never make live calls. setdefault keeps
+    # an explicit DISABLE_LLM=0 able to override for a deliberate live run.
+    os.environ.setdefault("DISABLE_LLM", "1")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     print("Ratio penalty curve (rupees per lost fight):")
