@@ -58,10 +58,18 @@ def share_counts(full: pd.DataFrame) -> dict[str, pd.Series]:
     }
 
 
-def build_features(df: pd.DataFrame, shares: dict[str, pd.Series] | None = None) -> pd.DataFrame:
+def build_features(
+    df: pd.DataFrame,
+    shares: dict[str, pd.Series] | None = None,
+    include_easy: bool = True,
+) -> pd.DataFrame:
     """Feature matrix for df. Pass `shares` computed from the full dataset when
     building a split on its own, otherwise train and test disagree about how
-    many accounts share a device."""
+    many accounts share a device.
+
+    include_easy=False drops the customer-supplied block. The money path runs
+    without it: a feature the claimant writes is a feature the claimant can
+    rewrite once they work out which wording pays."""
     if shares is None:
         shares = share_counts(df)
 
@@ -90,7 +98,7 @@ def build_features(df: pd.DataFrame, shares: dict[str, pd.Series] | None = None)
     # ---- EASY TO FAKE: whatever the customer told us -------------------------
     easy = _one_hot(df["complaint_category"], CATEGORY_LEVELS, "cat")
 
-    x = pd.concat([hard, easy], axis=1)
+    x = pd.concat([hard, easy], axis=1) if include_easy else hard
 
     leaked = set(FORBIDDEN) & set(x.columns)
     assert not leaked, f"forbidden column in feature matrix: {sorted(leaked)}"
@@ -116,6 +124,11 @@ def main() -> None:
     assert with_shares.equals(x.loc[test.index]), "passing shares in changed the matrix"
     alone = build_features(test)
     assert alone["device_share_count"].sum() < with_shares["device_share_count"].sum()
+
+    hard_only = build_features(df, include_easy=False)
+    dropped = set(x.columns) - set(hard_only.columns)
+    assert dropped == {c for c in x.columns if c.startswith("cat_")}, f"dropped wrong block: {dropped}"
+    assert hard_only.equals(x[hard_only.columns]), "dropping the easy block changed the hard block"
 
     print(f"{x.shape[0]} rows x {x.shape[1]} features")
     print(f"hard to fake: {[c for c in x.columns if not c.startswith('cat_')]}")
