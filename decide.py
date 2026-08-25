@@ -47,7 +47,9 @@ HUMAN_REVIEW_COST = 250         # analyst time to read one queued alert and call
 EPS = 1e-6                      # p_win saturates at exactly 0.0 and 1.0 (isotonic)
 
 
-def ratio_penalty(current_ratio: float, threshold: float = MONITORING_THRESHOLD) -> float:
+def ratio_penalty(current_ratio: float, threshold: float = MONITORING_THRESHOLD,
+                  floor: float = PENALTY_FLOOR, ceiling: float = PENALTY_CEILING,
+                  exponent: int = PENALTY_EXPONENT) -> float:
     """Rupee cost of one more lost fight, given where the ratio already sits.
 
     Cubic in the fraction of the threshold consumed:
@@ -67,7 +69,7 @@ def ratio_penalty(current_ratio: float, threshold: float = MONITORING_THRESHOLD)
     """
     assert current_ratio >= 0, f"negative ratio: {current_ratio}"
     consumed = min(current_ratio / threshold, 1.0)
-    return PENALTY_FLOOR + (PENALTY_CEILING - PENALTY_FLOOR) * consumed ** PENALTY_EXPONENT
+    return floor + (ceiling - floor) * consumed ** exponent
 
 
 def new_state(chargebacks: int, transactions: int) -> dict:
