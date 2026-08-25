@@ -99,7 +99,7 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     it raises the required EV margin by one ESCALATION_STEP, so it can flip a
     deflection -- including a first one -- whose margin is under ₹500. Measured
     ceiling: forcing the flag on for every alert in the 600-row test batch
-    changes 31 decisions and moves net by ~0.1%. It never enters ev_fight,
+    changes 4 decisions and moves net by ~0.8%. It never enters ev_fight,
     ev_refund or p_win. Passing None, or a record from a failed extraction,
     changes nothing: the neutral default is False, so an LLM outage cannot cost
     a customer their refund.
@@ -114,7 +114,11 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     penalty = ratio_penalty(ratio)
 
     ev_refund = -amount + FEE_SAVED
-    ev_fight = -REPRESENT_COST - (1.0 - p) * (amount + penalty)
+    # The penalty sits outside the (1 - p) term: filing the representment lets
+    # the chargeback formalise, and it counts against the ratio from filing --
+    # winning later does not take it back off. Fighting pays the ratio price
+    # win or lose; only the refund amount itself is at stake in the fight.
+    ev_fight = -REPRESENT_COST - penalty - (1.0 - p) * amount
     ev_decision = "fight" if ev_fight > ev_refund else "refund"
 
     customer = alert["customer_id"]
@@ -194,17 +198,14 @@ def apply_outcome(state: dict, record: dict, day: int, won: bool | None) -> None
     """Advance merchant state after a decision resolves.
 
     A deflection spends budget and never becomes a chargeback -- that is the
-    product. A lost fight becomes one. A queued alert moves nothing, because a
-    human has not acted on it yet.
-
-    ponytail: only *lost* fights increment the ratio here, per the spec. Under
-    Visa's VDMP the chargeback counts from the moment it is filed, win or lose,
-    which would make fighting materially more expensive near the threshold.
-    Worth modelling before anyone quotes these numbers at an acquirer.
+    product. EVERY fight becomes one, won or lost: under VDMP-style accounting
+    the chargeback counts against the ratio from the moment it is filed, and a
+    representment won weeks later does not remove it. A queued alert moves
+    nothing, because a human has not acted on it yet.
     """
     if record["final_action"] == "refund":
         state["deflections"].setdefault(record["customer_id"], []).append(day)
-    elif record["final_action"] == "fight" and won is False:
+    elif record["final_action"] == "fight" and won is not None:
         state["chargebacks"] += 1
 
 
@@ -272,7 +273,8 @@ def bracket_cost(alerts: pd.DataFrame, records: pd.DataFrame, penalty=None) -> d
     action = records["final_action"].to_numpy()
 
     refund_payoff = -amount + FEE_SAVED
-    fight_payoff = pd.Series(float(-REPRESENT_COST), index=alerts.index).where(
+    # Penalty on every fight, won or lost: the chargeback counted from filing.
+    fight_payoff = (pd.Series(float(-REPRESENT_COST), index=alerts.index) - penalty).where(
         won, -amount - REPRESENT_COST - penalty
     ).to_numpy()
 
@@ -310,13 +312,13 @@ def main() -> None:
         print(f"  ratio {r:6.2%}  ->  {ratio_penalty(r):10,.0f}")
 
     # --- the same alert, two merchants ------------------------------------
-    alert = _alert("DEMO-1", "CUST-DEMO", 5000.0)
+    alert = _alert("DEMO-1", "CUST-DEMO", 12_000.0)
     healthy = new_state(chargebacks=160, transactions=40_000)    # 0.40%
     stressed = new_state(chargebacks=340, transactions=40_000)   # 0.85%
     a = decide(alert, 0.75, healthy, day=0)
     b = decide(alert, 0.75, stressed, day=0)
 
-    print("\nSame alert (₹5,000, P(win) 0.75), two merchants:")
+    print("\nSame alert (₹12,000, P(win) 0.75), two merchants:")
     for label, r in (("0.40% ratio", a), ("0.85% ratio", b)):
         print(f"  {label}: penalty {r['ratio_penalty']:>9,.0f} | "
               f"EV fight {r['ev_fight']:>10,.0f} vs refund {r['ev_refund']:>9,.0f} "
@@ -341,7 +343,7 @@ def main() -> None:
 
     # --- a contradiction tightens marginal cases and only marginal cases --
     fresh = new_state(chargebacks=160, transactions=40_000)
-    marginal = _alert("DEMO-C", "CUST-FIRST", 21_000.0)   # EV margin ~334, under one step
+    marginal = _alert("DEMO-C", "CUST-FIRST", 25_000.0)   # EV margin ~268, under one step
     clean = decide(marginal, 0.20, fresh, day=0)
     flagged = decide(marginal, 0.20, fresh, day=0, llm={"has_internal_contradiction": True})
     assert clean["final_action"] == "refund" and flagged["final_action"] == "fight", \

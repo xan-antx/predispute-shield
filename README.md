@@ -26,6 +26,21 @@ inconsistency. The specific constants — floor ₹500, ceiling ₹50,000, cubic
 shape — are illustrative; the shape is the claim, the magnitudes are stand-ins
 for an acquirer's real fee schedule.
 
+## The complaint is written by the adversary
+
+The one free-text input in a dispute -- the complaint -- is authored by the
+person the merchant may be about to fight. Any model that reads it can be
+steered by rewording it, so this system is built around one rule: **a model
+that reads attacker-controlled text must not control money**. The LLM here
+extracts three fields from complaint text and none of them enters the EV
+arithmetic or the feature matrix; its single, measured route to a decision is
+bounded at ~0.8% of net (details in the AI section below), an outage degrades
+to exactly the no-LLM system, and the customer-supplied complaint category is
+excluded from the win-probability model outright -- measured to cost
+approximately nothing. The same logic decides what the model may see: the
+feature split in [features.py](features.py) is hard-to-fake evidence versus
+customer-authored claims, and money rides only on the first.
+
 ## Results
 
 Every number below is negative by construction — a pre-dispute alert always
@@ -34,27 +49,31 @@ of a 60/20/20 split, seed 42), full table in [results.md](results.md):
 
 | Strategy | Net ₹/1000 alerts | Fought | Fights lost | Precision | Recall |
 |---|--:|--:|--:|--:|--:|
-| always_fight | -2,924,648 | 600 | 307 | 48.8% | 100% |
+| always_fight | -3,901,315 | 600 | 307 | 48.8% | 100% |
 | always_refund | -1,816,286 | 0 | 0 | — | 0% |
-| random | -2,444,394 | 296 | 156 | 47.3% | 47.8% |
-| threshold_2000 | -1,852,913 | 297 | 140 | 52.9% | 53.6% |
-| **system** | **-1,301,784** | **147** | **28** | **81.0%** | 40.6% |
+| random | -2,911,061 | 296 | 156 | 47.3% | 47.8% |
+| threshold_2000 | -2,376,247 | 297 | 140 | 52.9% | 53.6% |
+| **system** | **-1,588,913** | **60** | **15** | **75.0%** | 15.4% |
 
 Against the incumbent behaviour — deflect everything, which is what a cautious
 merchant actually does, and which beats every naive alternative on this board —
-the system saves roughly **₹500k per 1000 alerts** (₹514,502 on this split;
-treat the last three digits as noise). Note that recall is low and deliberately
-so: below ₹1,600 no win probability justifies fighting, because deflecting a
-small winnable dispute beats winning it.
+the system saves roughly **₹227k per 1000 alerts** (₹227,373 on this split;
+treat the last digits as noise). That figure was ~₹514k before the ratio
+accounting was corrected to VDMP-style — a chargeback counts from filing, win
+or lose — which made fighting costlier everywhere and cut the claimed edge
+roughly in half; the correction was kept and the constants were not retuned to
+win the number back. Recall is low and deliberately so: below ₹3,600 no win
+probability justifies fighting, because even a won fight books the chargeback
+against the ratio, so deflecting a small winnable dispute beats winning it.
 
 ## It finds a winnable subpopulation, not the expensive ones
 
-The system fights 147 of 600 alerts with mean predicted P(win) 0.804 and an
-**actual win rate of 0.810**, against a base rate of 48.8% — the calibration
+The system fights 60 of 600 alerts with mean predicted P(win) 0.782 and an
+**actual win rate of 0.750**, against a base rate of 48.8% — the calibration
 holds on rows the model never saw, exactly where money is committed. The
 obvious null hypothesis is that it just fights the big-ticket alerts. It
-doesn't: fighting the 147 *most expensive* alerts instead wins only 53.7% and
-loses ₹278,870 more per 1000, and only 88 of the two sets of 147 overlap.
+doesn't: fighting the 60 *most expensive* alerts instead wins only 48.3% and
+loses ₹127,027 more per 1000, and only 34 of the two sets of 60 overlap.
 Amount matters — the EV threshold falls as amount rises, by design — but
 evidence selection is doing the majority of the work.
 
@@ -69,6 +88,16 @@ calibrated logistic regression whose coefficients recover the simulator's
 evidence weights in the correct order. Details in
 [calibration.md](calibration.md).
 
+Be clear about what this result is: a pipeline-correctness check, not a
+modelling achievement. The simulator generates labels from a sigmoid over
+linear evidence weights, and the model is a logistic regression over those
+same evidence features — correctly specified for the data-generating process
+by construction, so landing near the floor is close to guaranteed. What the
+number actually proves is the absence of two failure modes: no feature
+leakage (which would put the model *below* the floor) and no pipeline bugs
+(which would put it meaningfully above). On real data, where nobody hands you
+the generative model, the gap to the floor would be real and unknown.
+
 ## Where the AI is, and where it isn't
 
 Deterministic expected-value arithmetic decides money. The LLM
@@ -76,8 +105,10 @@ Deterministic expected-value arithmetic decides money. The LLM
 the feature matrix or the EV terms. Its single route to a decision is bounded
 and measured: an internal contradiction in the complaint raises the required
 EV margin by ₹500 in one policy gate, so it can tip cases whose margin is
-under that — 31 of 600 decisions when the flag is forced on for *every* alert,
-about 0.1% of net. `results.md` is checksum-identical with `DISABLE_LLM=1`,
+under that — 4 of 600 decisions when the flag is forced on for *every* alert,
+about 0.8% of net. (Under the pre-VDMP money model this was 31 decisions and
+0.1%: correcting the ratio accounting widened most refund margins past the
+gate's reach but raised the stakes of each remaining flip.) `results.md` is checksum-identical with `DISABLE_LLM=1`,
 and the whole system runs with no key at all: every LLM failure mode returns
 neutral defaults, chosen so an outage can never cost a customer a refund.
 
@@ -90,7 +121,7 @@ precision to ~0.75, so read precision as "high", not as certainty.
 
 The full decision path — dynamic ratio penalty, deflection budgets, velocity
 caps, a kill switch, and a human queue for P(win) between 0.40 and 0.60 —
-lands between ₹1.5k and ₹82k per 1000 *behind* the raw EV strategy, depending
+lands between ₹76k and ₹112k per 1000 *behind* the raw EV strategy, depending
 on how well humans resolve the 60 queued alerts (10% of the batch). That cost
 is accepted, not hidden: EV optimises the batch you can see, and the gates
 protect against the batch you can't — the serial refund farmer, the model gone
@@ -128,10 +159,8 @@ looking: switch only if boosting wins on *both* Brier and AUC. It won on
 neither, which the noise-floor analysis explains — there is almost nothing
 left to extract, so the model with readable coefficients keeps the slot.
 
-**Why doesn't the LLM decide anything?** Complaint text is written by the
-adversary. A model reading attacker-controlled text must not control money;
-here its worst case is measured at 0.1% of net, and an outage degrades to
-exactly the no-LLM system.
+**Why doesn't the LLM decide anything?** See "The complaint is written by
+the adversary" above — it is the design rule the whole system hangs off.
 
 **Why stdlib urllib instead of the openai package?** Groq's endpoint is one
 JSON POST. Adding a dependency for that violates the project's own rules more

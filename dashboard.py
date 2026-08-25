@@ -51,7 +51,7 @@ st.caption(f"{len(refunds)} deflections across the {len(records)}-alert test bat
 
 # --- 2. the same alert against a moving ratio ---------------------------
 st.header("Same alert, different merchant")
-DEMO_ALERT = {"alert_id": "DEMO", "customer_id": "CUST-DEMO", "amount": 5000.0}
+DEMO_ALERT = {"alert_id": "DEMO", "customer_id": "CUST-DEMO", "amount": 12_000.0}
 
 
 @st.cache_data
@@ -78,7 +78,7 @@ c2.metric("EV(fight)", f"₹{record['ev_fight']:,.0f}")
 c3.metric("EV(refund)", f"₹{record['ev_refund']:,.0f}")
 colour = {"fight": "red", "refund": "green"}.get(record["final_action"], "orange")
 c4.markdown(f"Action\n### :{colour}[{record['final_action'].upper()}]")
-st.caption("Fixed alert: ₹5,000, P(win) 0.75, signed delivery proof. Identical "
+st.caption("Fixed alert: ₹12,000, P(win) 0.75, signed delivery proof. Identical "
            "evidence resolves both ways -- the penalty prices in how close the "
            "merchant is to the card-network monitoring threshold.")
 

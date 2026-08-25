@@ -24,7 +24,10 @@ SEED = 42
 
 REPRESENT_COST = 400    # analyst time plus gateway fee to assemble and file an evidence packet
 FEE_SAVED = 1200        # network chargeback fee the merchant never pays if the dispute is deflected
-RATIO_PENALTY = 2000    # cost of a lost fight counting toward the monitoring ratio.
+RATIO_PENALTY = 2000    # ratio cost of the chargeback a fight lets formalise.
+                        # Charged on EVERY fight, won or lost: under VDMP-style
+                        # accounting the chargeback counts from filing, and winning
+                        # the representment later does not take it back off the ratio.
                         # ponytail: flat here. The real penalty is a step function of how close
                         # the merchant is to the ~1% threshold -- decide.py makes it dynamic.
 
@@ -74,14 +77,13 @@ def system(alerts: pd.DataFrame) -> pd.Series:
     """Expected value on the calibrated P(win) from model.py.
 
         EV(refund) = -amount + FEE_SAVED
-        EV(fight)  = -REPRESENT_COST - (1 - p) * (amount + RATIO_PENALTY)
+        EV(fight)  = -REPRESENT_COST - RATIO_PENALTY - (1 - p) * amount
 
-    Fight only when EV(fight) is strictly larger. Rearranged, that means fighting
-    once p exceeds 1 - (amount - FEE_SAVED - REPRESENT_COST) / (amount +
-    RATIO_PENALTY) -- a threshold that falls as the amount rises, because a large
-    refund forfeits a large sum while a lost fight costs the same flat penalty
-    either way. Below FEE_SAVED + REPRESENT_COST the threshold exceeds 1 and no
-    probability can justify a fight.
+    The ratio penalty sits outside the (1 - p) term: filing the representment is
+    what lets the chargeback formalise, so the ratio damage is paid win or lose.
+    Fight only when EV(fight) is strictly larger; rearranged, that means fighting
+    once p * amount exceeds FEE_SAVED + REPRESENT_COST + RATIO_PENALTY. Below
+    that sum in amount, no probability can justify a fight.
     """
     # Imported inside the function: model.py imports this module for the split,
     # so a top-level import would close the cycle.
@@ -92,7 +94,7 @@ def system(alerts: pd.DataFrame) -> pd.Series:
     # A 600-row slice on its own would report every ring account as unshared.
     p = predict_win_prob(alerts, shares=share_counts(pd.read_csv(ALERTS)))
     ev_refund = -alerts["amount"] + FEE_SAVED
-    ev_fight = -REPRESENT_COST - (1 - p) * (alerts["amount"] + RATIO_PENALTY)
+    ev_fight = -REPRESENT_COST - RATIO_PENALTY - (1 - p) * alerts["amount"]
     return ev_fight > ev_refund
 
 
@@ -110,7 +112,9 @@ def score(fight: pd.Series, test: pd.DataFrame) -> dict:
     won = test["would_win_if_fought"].astype(bool)
 
     refund_payoff = -amount + FEE_SAVED
-    fight_payoff = pd.Series(float(-REPRESENT_COST), index=test.index).where(
+    # The ratio penalty applies to every fight, won or lost -- the chargeback
+    # counted from the moment it was filed.
+    fight_payoff = pd.Series(float(-REPRESENT_COST - RATIO_PENALTY), index=test.index).where(
         won, -amount - REPRESENT_COST - RATIO_PENALTY
     )
     net = fight_payoff.where(fight, refund_payoff)
@@ -121,8 +125,9 @@ def score(fight: pd.Series, test: pd.DataFrame) -> dict:
 
     # Cost of a wrong call = money left on the table versus the right call.
     # FP regret is flat by construction (FEE_SAVED + REPRESENT_COST + RATIO_PENALTY);
-    # FN regret scales with amount, and goes negative below ~1600 because
-    # deflecting a small winnable dispute genuinely beats winning it.
+    # FN regret scales with amount, and goes negative below ~3600 because
+    # deflecting a small winnable dispute genuinely beats winning it once the
+    # win itself still books a chargeback against the ratio.
     fp_cost = (refund_payoff - fight_payoff)[fight & ~won].sum()
     fn_cost = (fight_payoff - refund_payoff)[~fight & won].sum()
 

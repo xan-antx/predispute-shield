@@ -42,10 +42,11 @@ claim worth defending. The floor of 500, the ceiling of 50,000 and the cubic
 exponent are plausible stand-ins, not sourced from an acquirer's fee schedule.
 Any rupee figure downstream inherits that.
 
-Related: only *lost* fights increment the chargeback count here. Under Visa's
-VDMP a chargeback counts from the moment it is filed, win or lose, which would
-make fighting materially more expensive near the threshold than this model
-suggests.
+The directional error this section used to flag -- only lost fights counting
+toward the ratio -- has been corrected: every fight now books the chargeback
+from filing, win or lose, in both the money model and the merchant state. The
+correction cut the headline saving from ~₹514k to ~₹227k per 1000 alerts and
+was kept without retuning any constant to compensate.
 
 ## No timestamps anywhere
 
