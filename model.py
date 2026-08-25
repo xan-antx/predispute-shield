@@ -178,6 +178,7 @@ def train(include_easy: bool = False) -> dict:
         "metrics": _score(y_test, raw),
         "corrected_metrics": _score(y_test, corrected),
         "test_table": calibration_table(y_test, raw),
+        "test_p": raw,   # aligned to evaluate.load()'s test order; sweep.py consumes it
         "baseline_brier": baseline,
     }
 

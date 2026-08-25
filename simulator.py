@@ -167,11 +167,13 @@ def make_customers(n: int) -> list[dict]:
     return customers
 
 
-def draw_amount(persona: str) -> float:
+def draw_amount(persona: str, sigma: float = 0.85) -> float:
+    """sigma widens or tightens the log-normal tail; sweep.py varies it, the
+    default reproduces the committed dataset byte for byte."""
     if persona == "opportunist" and random.random() < 0.5:
         # Parks just under the round number merchants tend to auto-refund below.
         return round(random.uniform(1500, 1999), 2)
-    return round(float(np.clip(np.random.lognormal(7.7, 0.85), 200, 80000)), 2)
+    return round(float(np.clip(np.random.lognormal(7.7, sigma), 200, 80000)), 2)
 
 
 def draw_delivery() -> tuple[str, str]:
@@ -208,9 +210,42 @@ def complaint_text(category: str, persona: str, days: int, contradict: bool) -> 
     return text + random.choice(PERSONA_SUFFIX[persona])
 
 
-def generate(n_alerts: int = N_ALERTS) -> pd.DataFrame:
-    random.seed(42)
-    np.random.seed(42)
+def _calibrate(scores: np.ndarray, base_rate: float, noise: float) -> tuple[float, float]:
+    """Find (scale, shift) so that p = sigmoid(scale * score + shift) hits a
+    target mean win rate and a target irreducible noise E[min(p, 1 - p)].
+
+    Nested bisection: shift controls the mean at any scale (monotone), scale
+    controls the noise once the mean is pinned (saturating the sigmoid drives
+    noise to zero, flattening it drives noise to min(base, 1 - base)). Both are
+    monotone on the actual score array, so 40 halvings each is plenty.
+    """
+    def stats(scale: float, shift: float) -> tuple[float, float]:
+        p = 1.0 / (1.0 + np.exp(-(scale * scores + shift)))
+        return float(p.mean()), float(np.minimum(p, 1 - p).mean())
+
+    def solve_shift(scale: float) -> float:
+        lo, hi = -10.0, 10.0
+        for _ in range(40):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if stats(scale, mid)[0] < base_rate else (lo, mid)
+        return (lo + hi) / 2
+
+    lo, hi = 0.05, 40.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if stats(mid, solve_shift(mid))[1] > noise else (lo, mid)
+    scale = (lo + hi) / 2
+    return scale, solve_shift(scale)
+
+
+def generate(n_alerts: int = N_ALERTS, seed: int = 42, amount_sigma: float = 0.85,
+             target_base_rate: float | None = None, target_noise: float | None = None,
+             return_probs: bool = False):
+    """Default arguments reproduce the committed dataset byte for byte: the
+    relabelling pass below only runs when sweep targets are given, and it uses
+    its own RNG so the primary streams are untouched either way."""
+    random.seed(seed)
+    np.random.seed(seed)
 
     customers = make_customers(N_CUSTOMERS)
     # Roughly 8% of alerts are built to be genuinely undecidable: in transit with
@@ -233,7 +268,7 @@ def generate(n_alerts: int = N_ALERTS) -> pd.DataFrame:
         row = {
             "alert_id": f"ALT{i:05d}",
             "customer_id": c["customer_id"],
-            "amount": draw_amount(c["persona"]),
+            "amount": draw_amount(c["persona"], amount_sigma),
             "account_age_days": c["account_age_days"],
             "prior_orders": c["prior_orders"],
             "prior_disputes": c["prior_disputes"],
@@ -253,6 +288,7 @@ def generate(n_alerts: int = N_ALERTS) -> pd.DataFrame:
             # Clamp the loyalty/dispute terms so these stay coin flips by
             # construction rather than by luck.
             score = float(np.clip(score, -0.4, 0.4))
+        row["_score"] = score
         p_win = 1.0 / (1.0 + np.exp(-score))
         # Sampled, not thresholded: two identical evidence packets can land
         # differently at arbitration, and that irreducible noise is the whole
@@ -260,7 +296,19 @@ def generate(n_alerts: int = N_ALERTS) -> pd.DataFrame:
         row["would_win_if_fought"] = int(np.random.random() < p_win)
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    scores = df.pop("_score").to_numpy()
+    probs = 1.0 / (1.0 + np.exp(-scores))
+    if target_base_rate is not None or target_noise is not None:
+        # Sweep path: re-map the same evidence scores through a calibrated
+        # sigmoid and resample labels from a dedicated RNG. Evidence, personas
+        # and amounts are untouched -- only how forgiving the world is changes.
+        scale, shift = _calibrate(scores,
+                                  target_base_rate if target_base_rate is not None else 0.5,
+                                  target_noise if target_noise is not None else 0.2)
+        probs = 1.0 / (1.0 + np.exp(-(scale * scores + shift)))
+        df["would_win_if_fought"] = (np.random.default_rng(seed).random(len(df)) < probs).astype(int)
+    return (df, probs) if return_probs else df
 
 
 def main() -> None:

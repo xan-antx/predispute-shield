@@ -93,8 +93,14 @@ def system(alerts: pd.DataFrame) -> pd.Series:
     # Share counts come from the whole file, matching how the model was trained.
     # A 600-row slice on its own would report every ring account as unshared.
     p = predict_win_prob(alerts, shares=share_counts(pd.read_csv(ALERTS)))
-    ev_refund = -alerts["amount"] + FEE_SAVED
-    ev_fight = -REPRESENT_COST - RATIO_PENALTY - (1 - p) * alerts["amount"]
+    return fight_ev_rule(alerts["amount"], p)
+
+
+def fight_ev_rule(amount: pd.Series, p) -> pd.Series:
+    """The EV comparison itself, shared with sweep.py so a money-model change
+    cannot quietly fork between the leaderboard and the sweep."""
+    ev_refund = -amount + FEE_SAVED
+    ev_fight = -REPRESENT_COST - RATIO_PENALTY - (1 - p) * amount
     return ev_fight > ev_refund
 
 
