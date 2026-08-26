@@ -105,7 +105,7 @@ def decide(alert: dict, p_win: float, state: dict, day: int, kill_switch: bool =
     it raises the required EV margin by one ESCALATION_STEP, so it can flip a
     deflection -- including a first one -- whose margin is under ₹500. Measured
     ceiling: forcing the flag on for every alert in the 600-row test batch
-    changes 4 decisions and moves net by ~0.8%. It never enters ev_fight,
+    changes 14 decisions and moves net by ~0.33% (at the 1.5% threshold). It never enters ev_fight,
     ev_refund or p_win. Passing None, or a record from a failed extraction,
     changes nothing: the neutral default is False, so an LLM outage cannot cost
     a customer their refund.

@@ -55,7 +55,7 @@ steered by rewording it, so this system is built around one rule: **a model
 that reads attacker-controlled text must not control money**. The LLM here
 extracts three fields from complaint text and none of them enters the EV
 arithmetic or the feature matrix; its single, measured route to a decision is
-bounded at ~0.8% of net (details in the AI section below), an outage degrades
+bounded at ~0.33% of net (details in the AI section below), an outage degrades
 to exactly the no-LLM system, and the customer-supplied complaint category is
 excluded from the win-probability model outright -- measured to cost
 approximately nothing. The same logic decides what the model may see: the
@@ -142,10 +142,10 @@ Deterministic expected-value arithmetic decides money. The LLM
 the feature matrix or the EV terms. Its single route to a decision is bounded
 and measured: an internal contradiction in the complaint raises the required
 EV margin by ₹500 in one policy gate, so it can tip cases whose margin is
-under that — 4 of 600 decisions when the flag is forced on for *every* alert,
-about 0.8% of net. (Under the pre-correction money model this was 31 decisions and
-0.1%: correcting the ratio accounting widened most refund margins past the
-gate's reach but raised the stakes of each remaining flip.) `results.md` is checksum-identical with `DISABLE_LLM=1`,
+under that — 14 of 600 decisions when the flag is forced on for *every* alert,
+about 0.33% of net, re-measured under the 1.5% VAMP threshold. (The bound has
+moved with each money-model correction — 31 decisions, then 4, now 14 — because
+the margins it operates on move; the mechanism and its smallness have not.) `results.md` is checksum-identical with `DISABLE_LLM=1`,
 and the whole system runs with no key at all: every LLM failure mode returns
 neutral defaults, chosen so an outage can never cost a customer a refund.
 

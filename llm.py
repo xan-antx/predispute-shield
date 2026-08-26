@@ -5,7 +5,8 @@ to a decision. complaint_category is already excluded from features.py;
 specificity_score is reporting only; has_internal_contradiction feeds exactly
 one policy gate in decide.py, where it raises the required EV margin by one
 step (₹500) -- enough to tip a deflection whose margin is under that, and
-measured at 4 of 600 decisions (~0.8% of net) when forced on for every alert.
+measured at 14 of 600 decisions (~0.33% of net) when forced on for every
+alert, under the 1.5% VAMP threshold.
 It never enters ev_fight, ev_refund, p_win or the feature matrix. If this file
 returned "refund" it would be a different system with a different risk profile,
 and the argument for it would have to be made to a regulator rather than a
