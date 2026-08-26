@@ -2,14 +2,17 @@
 
 Razorpay AI Buildathon, Track 02 (AI Risk Manager).
 
-**The finding this system is built on:** under the card networks' own
-accounting, a chargeback counts against the merchant's monitoring ratio from
-the moment it is filed — winning the representment later does not take it back
-off. It follows that there exist disputes worth refunding **even at P(win) =
-1.0**: the ratio slot is spent whether you win or lose, and only a refund in
-the pre-dispute window prevents the dispute from ever existing. That is a
-consequence of network rules, not of this simulator. Everything below is
-machinery for pricing that trade per alert.
+**The finding this system is built on:** under Visa's VAMP (the Visa Acquirer
+Monitoring Program, which replaced VDMP in April 2025), a dispute counts
+against the merchant's monitoring ratio from the moment it is filed — winning
+the representment later does not take it back off — while **disputes resolved
+through Visa's own pre-dispute solutions (RDR, CDRN) are excluded from the
+VAMP numerator entirely**. Deflection is not a trick; it is carved out by the
+network's own rules. It follows that there exist disputes worth refunding
+**even at P(win) = 1.0**: the ratio slot is spent whether you win or lose, and
+only a refund in the pre-dispute window prevents the dispute from ever
+existing. That is a cited rule, not an inference from this simulator.
+Everything below is machinery for pricing that trade per alert.
 
 ## The problem
 
@@ -25,17 +28,24 @@ all.
 
 ## Why the window is worth more than the fee
 
-Card networks put merchants into monitoring programmes when the chargeback
-ratio crosses roughly 1% of transactions: fines first, then mandated
-remediation, then loss of card processing. So the cost of losing one dispute is
+Visa's VAMP merges TC40 fraud reports and TC15 disputes into one count-based
+ratio over settled transactions. The merchant **Excessive** threshold is
+**1.50% effective 1 April 2026** (down from 2.20% during the transition year),
+across US, Canada, EU and APAC: identification first, then fines and mandated
+remediation, then loss of card processing. So the cost of one more dispute is
 not flat — it rises steeply as the merchant approaches the line. This system
 prices that in with a convex penalty (`ratio_penalty` in
-[decide.py](decide.py)): ₹896 per lost fight at 20% of the threshold, ₹30,899
-at 85%. The same alert, same evidence, resolves *fight* for a healthy merchant
-and *refund* for a stressed one, and that is correct behaviour, not
-inconsistency. The specific constants — floor ₹500, ceiling ₹50,000, cubic
-shape — are illustrative; the shape is the claim, the magnitudes are stand-ins
-for an acquirer's real fee schedule.
+[decide.py](decide.py)): ₹896 per fight at 20% of the threshold, ₹30,893 at
+85%. Because the ratio is count-based, not value-based, a flat per-event
+penalty is the correct shape rather than a simplification — a ₹200 dispute
+burns the same slot as an ₹80,000 one. And because the numerator counts TC40
+fraud reports too, blanket refunds no longer protect the ratio the way they
+did under the legacy programmes: a refund can stop a dispute, but not the
+fraud report already filed. Selective deflection is what remains. The same
+alert, same evidence, resolves *fight* for a healthy merchant and *refund*
+for a stressed one — correct behaviour, not inconsistency. The penalty's
+floor, ceiling and curve constants remain illustrative stand-ins for an
+acquirer's real fee schedule.
 
 ## The complaint is written by the adversary
 
@@ -70,8 +80,8 @@ Against the incumbent behaviour — deflect everything, which is what a cautious
 merchant actually does, and which beats every naive alternative on this board —
 the system saves roughly **₹227k per 1000 alerts** (₹227,373 on this split;
 treat the last digits as noise). That figure was ~₹514k before the ratio
-accounting was corrected to VDMP-style — a chargeback counts from filing, win
-or lose — which made fighting costlier everywhere and cut the claimed edge
+accounting was corrected to VAMP's — a dispute counts from filing, win or
+lose — which made fighting costlier everywhere and cut the claimed edge
 roughly in half; the correction was kept and the constants were not retuned to
 win the number back. Recall is low and deliberately so: below ₹3,600 no win
 probability justifies fighting, because even a won fight books the chargeback
@@ -97,11 +107,11 @@ always_refund in 26; in the 27th (tight amounts, 30% noise, 35% base rate) it
 fought once, lost that fight, and landed ₹6,000 per 1000 below the incumbent —
 exactly one flipped outcome, indistinguishable from always_refund at this
 sample size. [penalty_sweep.md](penalty_sweep.md) varies the invented penalty
-constants (floor × ceiling × exponent): 15 wins, 9 exact ties where the curve
-prices every fight out and the system degenerates to the incumbent, and 3
-cells within one to two flipped outcomes below it. Across all 54 worlds the
-upside reaches +₹1.7M per 1000 and the worst cell is a scratch inside the
-noise band: when there is winnable volume to find, the system finds it, and
+constants (floor × ceiling × exponent): 23 wins, 3 exact ties where the curve
+prices every fight out and the system degenerates to the incumbent, and one
+cell ₹283 below it — a fraction of a single flipped outcome. Across all 54
+worlds the upside reaches +₹1.7M per 1000 and the worst cell is a scratch
+inside the noise band: when there is winnable volume to find, the system finds it, and
 when there is none it degrades to the incumbent rather than below it.
 
 ## The model is at the noise floor
@@ -133,7 +143,7 @@ the feature matrix or the EV terms. Its single route to a decision is bounded
 and measured: an internal contradiction in the complaint raises the required
 EV margin by ₹500 in one policy gate, so it can tip cases whose margin is
 under that — 4 of 600 decisions when the flag is forced on for *every* alert,
-about 0.8% of net. (Under the pre-VDMP money model this was 31 decisions and
+about 0.8% of net. (Under the pre-correction money model this was 31 decisions and
 0.1%: correcting the ratio accounting widened most refund margins past the
 gate's reach but raised the stakes of each remaining flip.) `results.md` is checksum-identical with `DISABLE_LLM=1`,
 and the whole system runs with no key at all: every LLM failure mode returns
@@ -148,7 +158,7 @@ precision to ~0.75, so read precision as "high", not as certainty.
 
 The full decision path — dynamic ratio penalty, deflection budgets, velocity
 caps, a kill switch, and a human queue for P(win) between 0.40 and 0.60 —
-lands between ₹76k and ₹112k per 1000 *behind* the raw EV strategy, depending
+lands between ₹23k and ₹60k per 1000 *behind* the raw EV strategy, depending
 on how well humans resolve the 60 queued alerts (10% of the batch). That cost
 is accepted, not hidden: EV optimises the batch you can see, and the gates
 protect against the batch you can't — the serial refund farmer, the model gone

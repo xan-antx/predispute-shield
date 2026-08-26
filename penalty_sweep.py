@@ -12,7 +12,7 @@ only the convex shape has to be defended.
 Same world every cell: the canonical seed-42 dataset (regenerated up front) and
 one trained model. Only the penalty curve varies, so any Δ movement is the
 curve's doing. Dynamics per cell: ratio starts at 0.40% (160 of 40,000), every
-fight books its chargeback from filing (VDMP), so fighting drives the penalty up
+fight books its dispute from filing (VAMP), so fighting drives the penalty up
 underneath the batch. No gates or queue here -- this is the pure EV strategy,
 matching sweep.py, so the two sweeps answer cleanly separable questions.
 """

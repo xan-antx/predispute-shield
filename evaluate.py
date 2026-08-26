@@ -25,11 +25,13 @@ SEED = 42
 REPRESENT_COST = 400    # analyst time plus gateway fee to assemble and file an evidence packet
 FEE_SAVED = 1200        # network chargeback fee the merchant never pays if the dispute is deflected
 RATIO_PENALTY = 2000    # ratio cost of the chargeback a fight lets formalise.
-                        # Charged on EVERY fight, won or lost: under VDMP-style
-                        # accounting the chargeback counts from filing, and winning
-                        # the representment later does not take it back off the ratio.
+                        # Charged on EVERY fight, won or lost: under VAMP the
+                        # dispute counts from filing, and winning the representment
+                        # later does not take it back off the ratio. VAMP is
+                        # count-based, so a flat per-event penalty is the correct
+                        # shape, not a simplification.
                         # ponytail: flat here. The real penalty is a step function of how close
-                        # the merchant is to the ~1% threshold -- decide.py makes it dynamic.
+                        # the merchant is to the 1.5% threshold -- decide.py makes it dynamic.
 
 # Ground truth and analysis-only columns. Never handed to a strategy.
 HIDDEN = ["would_win_if_fought", "persona", "ring_archetype", "text_contradiction"]

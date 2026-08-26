@@ -32,7 +32,11 @@ from evaluate import FEE_SAVED, REPRESENT_COST
 # acquirer's fee schedule and the network's published programme thresholds, and
 # they differ by region, MCC and processing volume. The shape is the claim here;
 # the magnitudes are a plausible stand-in.
-MONITORING_THRESHOLD = 0.01     # ~1% is where Visa/Mastercard programmes begin
+MONITORING_THRESHOLD = 0.015    # VAMP merchant 'Excessive' threshold, effective
+                                # 1 April 2026 (2.20% during the 2025 transition
+                                # year). Count-based: TC40 fraud reports plus TC15
+                                # disputes over settled count, which is why the
+                                # penalty is flat per event, not scaled by amount.
 PENALTY_FLOOR = 500             # a lost fight at a healthy ratio: just the admin
 PENALTY_CEILING = 50_000        # at the threshold: fines, remediation, review
 PENALTY_EXPONENT = 3            # convexity -- see ratio_penalty
@@ -200,9 +204,11 @@ def apply_outcome(state: dict, record: dict, day: int, won: bool | None) -> None
     """Advance merchant state after a decision resolves.
 
     A deflection spends budget and never becomes a chargeback -- that is the
-    product. EVERY fight becomes one, won or lost: under VDMP-style accounting
-    the chargeback counts against the ratio from the moment it is filed, and a
-    representment won weeks later does not remove it. A queued alert moves
+    product. EVERY fight becomes one, won or lost: under VAMP (the programme
+    that replaced VDMP in April 2025) the dispute counts against the ratio from
+    the moment it is filed, and a representment won weeks later does not remove
+    it -- while disputes resolved through pre-dispute solutions (RDR/CDRN) are
+    excluded from the numerator by Visa's own rules. A queued alert moves
     nothing, because a human has not acted on it yet.
     """
     if record["final_action"] == "refund":
@@ -310,7 +316,7 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     print("Ratio penalty curve (rupees per lost fight):")
-    for r in (0.000, 0.002, 0.004, 0.006, 0.008, 0.0085, 0.010, 0.012):
+    for r in (0.000, 0.003, 0.006, 0.009, 0.012, 0.0135, 0.015, 0.018):
         print(f"  ratio {r:6.2%}  ->  {ratio_penalty(r):10,.0f}")
 
     # --- the same alert, two merchants ------------------------------------
@@ -345,7 +351,7 @@ def main() -> None:
 
     # --- a contradiction tightens marginal cases and only marginal cases --
     fresh = new_state(chargebacks=160, transactions=40_000)
-    marginal = _alert("DEMO-C", "CUST-FIRST", 25_000.0)   # EV margin ~268, under one step
+    marginal = _alert("DEMO-C", "CUST-FIRST", 14_000.0)   # EV margin ~238, under one step
     clean = decide(marginal, 0.20, fresh, day=0)
     flagged = decide(marginal, 0.20, fresh, day=0, llm={"has_internal_contradiction": True})
     assert clean["final_action"] == "refund" and flagged["final_action"] == "fight", \

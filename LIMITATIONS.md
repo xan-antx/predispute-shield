@@ -48,6 +48,17 @@ from filing, win or lose, in both the money model and the merchant state. The
 correction cut the headline saving from ~₹514k to ~₹227k per 1000 alerts and
 was kept without retuning any constant to compensate.
 
+## VAMP's 1,500-event floor is not modelled
+
+VAMP only formally monitors a merchant once fraud reports plus disputes reach
+1,500 combined events in a month. Below that floor the network programme does
+not bite, and this system's ratio penalty overstates the network-side cost --
+though acquirers run their own, stricter thresholds underneath, which is what
+the penalty floor loosely stands in for. The simulated merchant here (160
+chargebacks against 40,000 transactions as a starting point) is treated as
+monitored; a small merchant is not, and for them the EV case for fighting is
+stronger than this system computes.
+
 ## No timestamps anywhere
 
 `simulator.py` emits no event time. Two things work around it and both are marked

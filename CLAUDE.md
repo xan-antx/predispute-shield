@@ -62,7 +62,9 @@ Judged on: problem taste, build quality, appropriate AI use, failure recovery.
 
 \- represent: fight the chargeback with an evidence packet
 
-\- ratio: chargebacks / total transactions. Above \~1% the merchant enters a
+\- ratio: (fraud reports + disputes) / settled count. Above 1.5% (VAMP, from
+
+&#x20; April 2026) the merchant is Excessive and enters a
 
 &#x20; card-network monitoring programme (fines, then loss of card processing).
 
