@@ -1,9 +1,16 @@
+
 """Fire one sample pre-dispute alert at the webhook and print the decision.
 
 The payload is the enriched shape webhook.py expects: the Ethoca-style dispute
 fields plus the merchant's own order-history enrichment. Strong evidence on
-purpose (signed proof, delivered, long history) so the demo shows a FIGHT;
-change delivery_proof to "none" to watch it flip to a refund.
+purpose (signed proof, delivered, long history) so the demo shows a FIGHT.
+
+Changing only delivery_proof to "none" drops P(win) to ~0.40 -- just inside
+the 0.40-0.60 coin-flip band, so it routes to the human QUEUE, not a refund:
+one field changes and the system declines to automate the call. For the
+refund outcome, weaken the alert fully: delivery_status "lost", proof
+"none", account_age_days 30, prior_orders 1, prior_disputes 1 -- P(win)
+~0.04, an EV refund, executed through actions.execute_refund.
 """
 
 import json
