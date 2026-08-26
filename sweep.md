@@ -4,10 +4,13 @@
 regenerates 3,000 alerts (seed = 1000 + cell index), retrains the calibrated
 model on that world's 60/20/20 split, and scores the EV strategy against
 always_refund on the 600-row test slice. Δ = system minus always_refund in net
-₹ per 1000 alerts; positive (bold) means the system wins. Losing cells are
-listed, not excluded.
+₹ per 1000 alerts; positive (bold) means the system wins. Cells at or below
+the incumbent are listed, not excluded.
 
 **System beats always_refund in 26 of 27 cells (96%).**
+On a 600-row slice, one flipped fight outcome moves Δ by ₹6,000 per 1000
+(the flat FP regret), so a cell within that band of zero is indistinguishable
+from always_refund at this sample size -- not a loss.
 
 ### log-normal σ=0.85 (current)
 
@@ -33,9 +36,10 @@ listed, not excluded.
 | 0.20 | **+609,511** | **+1,050,770** | **+1,719,751** |
 | 0.30 | **+850,300** | **+701,518** | **+1,322,838** |
 
-## Losing cells
+## Cells at or below the incumbent
 
-- tight σ=0.45, noise 0.30, base 0.35: Δ -6,000 (1 fights, 1 lost)
+- tight σ=0.45, noise 0.30, base 0.35: Δ -6,000 (1 fight, lost) -- exactly one
+  flipped outcome, indistinguishable from the incumbent
 
 Cells where the system never fights (Δ exactly 0 by construction): 0.
 

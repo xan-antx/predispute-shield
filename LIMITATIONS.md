@@ -70,8 +70,12 @@ Across six live test-mode attempts, every refund of the entire remaining
 balance of a payment (₹10 of ₹10; ₹8 when ₹2 was already refunded) returned
 Razorpay's generic `400 BAD_REQUEST_ERROR: invalid request sent`, while every
 partial refund of the same payment, through the same code path, with the same
-field shape, succeeded. The likely fix — omit `amount` entirely, since
-Razorpay defaults an amount-less refund to the full balance — is untested
-here. A production deployment refunds whole payments as its normal case, so
-it would hit this immediately; resolve it against Razorpay support or the
-omit-amount variant before relying on `execute_refund` for full refunds.
+field shape, succeeded. The omit-amount hypothesis — Razorpay defaults an amount-less
+refund to the full balance, so leaving the field out might dodge the
+validation — was then tested live and refuted: the same generic 400 comes
+back. Seven attempts total: three full-remaining refunds failed (explicit
+₹10, explicit ₹8, amount omitted with ₹4 remaining), five partial refunds
+succeeded. The quirk is refunding a payment to zero, however expressed, and
+its mechanism is invisible from outside. A production deployment refunds
+whole payments as its normal case, so it would hit this immediately; settle
+it with Razorpay support before relying on `execute_refund` for full refunds.

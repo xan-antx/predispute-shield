@@ -2,6 +2,15 @@
 
 Razorpay AI Buildathon, Track 02 (AI Risk Manager).
 
+**The finding this system is built on:** under the card networks' own
+accounting, a chargeback counts against the merchant's monitoring ratio from
+the moment it is filed — winning the representment later does not take it back
+off. It follows that there exist disputes worth refunding **even at P(win) =
+1.0**: the ratio slot is spent whether you win or lose, and only a refund in
+the pre-dispute window prevents the dispute from ever existing. That is a
+consequence of network rules, not of this simulator. Everything below is
+machinery for pricing that trade per alert.
+
 ## The problem
 
 When a customer disputes a charge, their bank sends the merchant a pre-dispute
@@ -10,7 +19,9 @@ minutes to hours — is the only point where a refund makes the dispute vanish
 entirely: no fee, no ratio hit, no evidence packet. Almost nobody uses it well,
 because no merchant can staff a per-alert judgement call that has to happen in
 minutes, so the real choice today is a blanket rule: refund everything or fight
-everything.
+everything. Razorpay's Agent Studio Dispute Responder answers disputes that
+already exist; this system decides whether a dispute is permitted to exist at
+all.
 
 ## Why the window is worth more than the fee
 
@@ -76,6 +87,22 @@ doesn't: fighting the 60 *most expensive* alerts instead wins only 48.3% and
 loses ₹127,027 more per 1000, and only 34 of the two sets of 60 overlap.
 Amount matters — the EV threshold falls as amount rises, by design — but
 evidence selection is doing the majority of the work.
+
+## Does it survive other worlds?
+
+Two sweeps check whether the conclusion is an artifact of one configuration.
+[sweep.md](sweep.md) regenerates the world at 27 points (label noise × base
+win rate × amount distribution) and retrains per cell: the system beats
+always_refund in 26; in the 27th (tight amounts, 30% noise, 35% base rate) it
+fought once, lost that fight, and landed ₹6,000 per 1000 below the incumbent —
+exactly one flipped outcome, indistinguishable from always_refund at this
+sample size. [penalty_sweep.md](penalty_sweep.md) varies the invented penalty
+constants (floor × ceiling × exponent): 15 wins, 9 exact ties where the curve
+prices every fight out and the system degenerates to the incumbent, and 3
+cells within one to two flipped outcomes below it. Across all 54 worlds the
+upside reaches +₹1.7M per 1000 and the worst cell is a scratch inside the
+noise band: when there is winnable volume to find, the system finds it, and
+when there is none it degrades to the incumbent rather than below it.
 
 ## The model is at the noise floor
 

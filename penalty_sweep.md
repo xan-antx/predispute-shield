@@ -7,7 +7,7 @@ fight counts from filing). One canonical seed-42 dataset and one trained model
 throughout, so the curve is the only thing that varies. Δ = system minus
 always_refund (-1,816,286) in net ₹ per 1000 alerts; positive (bold) wins.
 
-**System beats always_refund in 15 of 27 cells, ties it in 9, loses in 3.** Every tie is a zero-fight cell: the curve prices all fights out and the system degenerates to always_refund exactly. Winning Δ ranges +7,840 to +149,907; the worst loss is -7,573.
+**System beats always_refund in 15 of 27 cells, ties it in 9, and lands below it in 3.** Every tie is a zero-fight cell: the curve prices all fights out and the system degenerates to always_refund exactly. Each below-incumbent cell sits within one to two flipped fight outcomes of zero (a flip moves Δ by ₹6,000 per 1000), which is indistinguishable from the incumbent at this sample size. Winning Δ ranges +7,840 to +149,907; the worst cell anywhere is -7,573.
 
 ### exponent 1 (linear)
 
@@ -33,7 +33,7 @@ always_refund (-1,816,286) in net ₹ per 1000 alerts; positive (bold) wins.
 | 500 | **+149,907** | **+60,097** | **+13,647** |
 | 1,000 | **+119,574** | **+45,662** | **+7,840** |
 
-## Losing cells
+## Cells at or below the incumbent
 
 - floor 1,000, ceiling 50,000, exponent 2: Δ -7,573 (4 fights)
 - floor 500, ceiling 50,000, exponent 2: Δ -4,783 (4 fights)

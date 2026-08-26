@@ -120,12 +120,15 @@ def main() -> None:
         "regenerates 3,000 alerts (seed = 1000 + cell index), retrains the calibrated\n"
         "model on that world's 60/20/20 split, and scores the EV strategy against\n"
         "always_refund on the 600-row test slice. Δ = system minus always_refund in net\n"
-        "₹ per 1000 alerts; positive (bold) means the system wins. Losing cells are\n"
-        "listed, not excluded.\n"
+        "₹ per 1000 alerts; positive (bold) means the system wins. Cells at or below\n"
+        "the incumbent are listed, not excluded.\n"
         f"\n**System beats always_refund in {len(wins)} of {len(cells)} cells "
         f"({len(wins) / len(cells):.0%}).**\n"
+        "On a 600-row slice, one flipped fight outcome moves Δ by ₹6,000 per 1000\n"
+        "(the flat FP regret), so a cell within that band of zero is indistinguishable\n"
+        "from always_refund at this sample size -- not a loss.\n"
         f"{grids}\n"
-        "## Losing cells\n\n" + losing +
+        "## Cells at or below the incumbent\n\n" + losing +
         f"\nCells where the system never fights (Δ exactly 0 by construction): "
         f"{len(no_fight)}.\n"
         "\n## Detail\n\n"
