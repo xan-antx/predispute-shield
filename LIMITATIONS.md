@@ -90,3 +90,24 @@ succeeded. The quirk is refunding a payment to zero, however expressed, and
 its mechanism is invisible from outside. A production deployment refunds
 whole payments as its normal case, so it would hit this immediately; settle
 it with Razorpay support before relying on `execute_refund` for full refunds.
+
+## TC40 asymmetry: deflection saves the dispute, not the fraud report
+
+A pre-dispute refund prevents the TC15 dispute from ever existing, and VAMP
+excludes RDR/CDRN-resolved cases from its numerator — but if the cardholder's
+bank already filed a TC40 fraud report, that event is in the numerator
+regardless of what the merchant does next. Deflection cannot un-file it. For
+fraud-coded alerts, then, this model **overstates deflection's ratio benefit**:
+it credits every refund with saving a full ratio slot, when an
+unauthorised-category alert has often already spent one via the TC40. The bias
+direction is consistent — the system looks slightly better than it is exactly
+on the alert category where fraud rings live, which tilts EV toward refunding
+them.
+
+The fix is known and bounded: discount the ratio component of `FEE_SAVED` for
+unauthorised-category alerts by the probability that a TC40 was already filed.
+It is not implemented because the simulator does not model TC40 filing at all,
+so the discount would be an invented parameter dressed up as a correction —
+worse than an acknowledged bias, because it would look measured. On real data
+the TC40 feed exists and the discount becomes an observable rate rather than a
+guess.
